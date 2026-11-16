@@ -5,12 +5,33 @@ import sqlite3
 import math
 from geopy.geocoders import Nominatim
 
-# Читаем токен безопасно из переменных окружения BotHost (либо подставляем вручную, если запускаем локально)
-TOKEN = os.getenv('BOT_TOKEN') or os.getenv('TOKEN') or 'ВАШ_ТОКЕН_ОТ_BOTFATHER'
+TOKEN = os.environ.get('BOT_TOKEN') or os.environ.get('TOKEN') or 'ВАШ_ТОКЕН_ОТ_BOTFATHER'
 bot = telebot.TeleBot(TOKEN)
-geolocator = Nominatim(user_agent="avtovinchik_bot_v1")
+geolocator = Nominatim(user_agent="avtovinchik_bot_v3")
 
-# --- БАЗА ДАННЫХ ---
+CAR_CATALOG = {
+    "Лада (ВАЗ)": ["Приора", "Гранта", "Веста", "Калина", "Нива 4x4 / Legend", "2114 / 2115", "2107 / Классика", "Ларгус", "XRAY"],
+    "Toyota": ["Camry", "Corolla", "RAV4", "Land Cruiser", "Land Cruiser Prado", "Avensis", "Mark II", "Chaser", "Solaris / Vitz"],
+    "Hyundai": ["Solaris", "Creta", "Elantra", "Sonata", "Tucson", "Santa Fe", "Accent", "Getz"],
+    "Kia": ["Rio", "Ceed", "Sportage", "Optima", "K5", "Cerato", "Sorento", "Spectra"],
+    "Volkswagen": ["Polo", "Tiguan", "Passat", "Golf", "Jetta", "Touareg", "Transporter"],
+    "Skoda": ["Octavia", "Rapid", "Kodiaq", "Superb", "Fabia", "Yeti"],
+    "Nissan": ["Qashqai", "X-Trail", "Almera", "Teana", "Juke", "Note", "Murano"],
+    "Ford": ["Focus", "Mondeo", "Kuga", "Fiesta", "Fusion", "Transit"],
+    "Renault": ["Logan", "Duster", "Sandero", "Megane", "Kaptur", "Arkana"],
+    "Chevrolet": ["Cruze", "Lacetti", "Aveo", "Niva", "Cobalt", "Tahoe"],
+    "BMW": ["3 серия", "5 серия", "7 серия", "X5", "X3", "X6"],
+    "Mercedes-Benz": ["C-класс", "E-класс", "S-класс", "GLC", "GLE", "Sprinter"],
+    "Mazda": ["Mazda 3", "Mazda 6", "CX-5", "CX-7", "CX-9"],
+    "Mitsubishi": ["Lancer", "Outlander", "Pajero", "ASX", "L200"],
+    "Honda": ["Civic", "Accord", "CR-V", "Fit / Jazz"],
+    "Audi": ["A4", "A6", "A3", "Q5", "Q7"],
+    "ГАЗ": ["Газель Бизнес", "Газель NEXT", "Волга 3110 / 31105", "Соболь"],
+    "Chery": ["Tiggo 7 Pro", "Tiggo 4 / 4 Pro", "Tiggo 8 Pro", "Amulet"],
+    "Haval": ["Jolion", "F7 / F7x", "H9", "Dargo"],
+    "Geely": ["Coolray", "Monjaro", "Atlas / Atlas Pro", "Emgrand"]
+}
+
 def init_db():
     conn = sqlite3.connect('cars.db')
     c = conn.cursor()
@@ -82,19 +103,53 @@ def main_menu():
     markup.row('⚙️ Мой фильтр')
     return markup
 
+def cancel_markup():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add('❌ Отмена')
+    return markup
+
+def build_brands_markup(include_any=False):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    if include_any:
+        markup.add('Любая')
+    brands = list(CAR_CATALOG.keys())
+    for i in range(0, len(brands), 2):
+        row = brands[i:i+2]
+        markup.row(*row)
+    markup.row('✍️ Другая марка', '❌ Отмена')
+    return markup
+
+def build_models_markup(brand, include_any=False):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    if include_any:
+        markup.add('Любая')
+    models = CAR_CATALOG.get(brand, [])
+    for i in range(0, len(models), 2):
+        row = models[i:i+2]
+        markup.row(*row)
+    markup.row('✍️ Другая модель', '❌ Отмена')
+    return markup
+
+def check_cancel(message):
+    if message.text == '❌ Отмена':
+        if message.chat.id in temp_data:
+            del temp_data[message.chat.id]
+        bot.send_message(message.chat.id, "Действие отменено. Возвращаемся в главное меню.", reply_markup=main_menu())
+        return True
+    return False
+
 @bot.message_handler(commands=['start'])
 def start(message):
     get_user_filter(message.chat.id)
     bot.send_message(
         message.chat.id,
-        "👋 Добро пожаловать в Автовинчик!\nВыберите действие в меню ниже:",
+        "👋 Добро пожаловать на Авторынок!\nВыберите действие в меню ниже:",
         reply_markup=main_menu()
     )
 
 # ================= ИНТЕРАКТИВНОЕ МЕНЮ ФИЛЬТРОВ =================
 def send_filter_menu(chat_id, message_id=None):
     f = get_user_filter(chat_id)
-    # f: 0:user_id, 1:brand, 2:model, 3:year_from, 4:year_to, 5:price_from, 6:price_to, 7:city_name, 8:lat, 9:lon, 10:radius, 11:docs
     docs_text = "Только чистые" if f[11] == 1 else "Все (включая проблемные)"
     loc_text = f"{f[7]} (+{f[10]} км)" if f[7] != 'Не задан' else "Вся Россия"
     price_to_str = "без потолка" if f[6] >= 99999999 else f"{f[6]:,} ₽".replace(',', ' ')
@@ -139,16 +194,71 @@ def open_filter_menu(message):
     send_filter_menu(message.chat.id)
 
 def set_f_brand(message):
+    if check_cancel(message):
+        return
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "❌ Выберите марку кнопкой или напишите текстом:", reply_markup=build_brands_markup(include_any=True))
+        bot.register_next_step_handler(msg, set_f_brand)
+        return
+    if message.text == '✍️ Другая марка':
+        msg = bot.send_message(message.chat.id, "✍️ Напишите название **марки** текстом:", parse_mode='Markdown', reply_markup=cancel_markup())
+        bot.register_next_step_handler(msg, set_f_brand_custom)
+        return
     val = 'Любая' if message.text.lower() == 'любая' else message.text.strip()
     update_filter_field(message.chat.id, 'brand', val)
+    update_filter_field(message.chat.id, 'model', 'Любая')
+    bot.send_message(message.chat.id, f"✅ Выбрана марка: **{val}**", parse_mode='Markdown', reply_markup=main_menu())
+    send_filter_menu(message.chat.id)
+
+def set_f_brand_custom(message):
+    if check_cancel(message):
+        return
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "❌ Напишите марку текстом:", reply_markup=cancel_markup())
+        bot.register_next_step_handler(msg, set_f_brand_custom)
+        return
+    val = message.text.strip()
+    update_filter_field(message.chat.id, 'brand', val)
+    update_filter_field(message.chat.id, 'model', 'Любая')
+    bot.send_message(message.chat.id, f"✅ Выбрана марка: **{val}**", parse_mode='Markdown', reply_markup=main_menu())
     send_filter_menu(message.chat.id)
 
 def set_f_model(message):
+    if check_cancel(message):
+        return
+    if not message.text:
+        f = get_user_filter(message.chat.id)
+        msg = bot.send_message(message.chat.id, "❌ Выберите модель кнопкой:", reply_markup=build_models_markup(f[1], include_any=True))
+        bot.register_next_step_handler(msg, set_f_model)
+        return
+    if message.text == '✍️ Другая модель':
+        msg = bot.send_message(message.chat.id, "✍️ Напишите название **модели** текстом:", parse_mode='Markdown', reply_markup=cancel_markup())
+        bot.register_next_step_handler(msg, set_f_model_custom)
+        return
     val = 'Любая' if message.text.lower() == 'любая' else message.text.strip()
     update_filter_field(message.chat.id, 'model', val)
+    bot.send_message(message.chat.id, f"✅ Выбрана модель: **{val}**", parse_mode='Markdown', reply_markup=main_menu())
+    send_filter_menu(message.chat.id)
+
+def set_f_model_custom(message):
+    if check_cancel(message):
+        return
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "❌ Напишите модель текстом:", reply_markup=cancel_markup())
+        bot.register_next_step_handler(msg, set_f_model_custom)
+        return
+    val = message.text.strip()
+    update_filter_field(message.chat.id, 'model', val)
+    bot.send_message(message.chat.id, f"✅ Выбрана модель: **{val}**", parse_mode='Markdown', reply_markup=main_menu())
     send_filter_menu(message.chat.id)
 
 def set_f_year(message):
+    if check_cancel(message):
+        return
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "❌ Напишите два года через пробел (например: `2008 2016`):", parse_mode='Markdown', reply_markup=cancel_markup())
+        bot.register_next_step_handler(msg, set_f_year)
+        return
     parts = message.text.strip().split()
     if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
         conn = sqlite3.connect('cars.db')
@@ -157,12 +267,19 @@ def set_f_year(message):
         c.execute('DELETE FROM viewed WHERE user_id = ?', (message.chat.id,))
         conn.commit()
         conn.close()
+        bot.send_message(message.chat.id, "✅ Годы обновлены!", reply_markup=main_menu())
         send_filter_menu(message.chat.id)
     else:
-        msg = bot.send_message(message.chat.id, "❌ Напишите два года через пробел (например: `2008 2016`):", parse_mode='Markdown')
+        msg = bot.send_message(message.chat.id, "❌ Напишите два года через пробел (например: `2008 2016`):", parse_mode='Markdown', reply_markup=cancel_markup())
         bot.register_next_step_handler(msg, set_f_year)
 
 def set_f_price(message):
+    if check_cancel(message):
+        return
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "❌ Напишите две суммы через пробел (например: `150000 600000`):", parse_mode='Markdown', reply_markup=cancel_markup())
+        bot.register_next_step_handler(msg, set_f_price)
+        return
     parts = message.text.strip().split()
     if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
         conn = sqlite3.connect('cars.db')
@@ -171,12 +288,15 @@ def set_f_price(message):
         c.execute('DELETE FROM viewed WHERE user_id = ?', (message.chat.id,))
         conn.commit()
         conn.close()
+        bot.send_message(message.chat.id, "✅ Бюджет обновлен!", reply_markup=main_menu())
         send_filter_menu(message.chat.id)
     else:
-        msg = bot.send_message(message.chat.id, "❌ Напишите две суммы через пробел без точек и запятых (например: `150000 600000`):", parse_mode='Markdown')
+        msg = bot.send_message(message.chat.id, "❌ Напишите две суммы через пробел без точек и запятых (например: `150000 600000`):", parse_mode='Markdown', reply_markup=cancel_markup())
         bot.register_next_step_handler(msg, set_f_price)
 
 def set_f_loc_step1(message):
+    if check_cancel(message):
+        return
     lat, lon, city_name = None, None, "Точка на карте"
     if message.location:
         lat, lon = message.location.latitude, message.location.longitude
@@ -186,23 +306,35 @@ def set_f_loc_step1(message):
         except:
             pass
     elif message.text:
-        loc = geolocator.geocode(message.text.strip())
-        if loc:
-            lat, lon = loc.latitude, loc.longitude
-            city_name = message.text.strip().capitalize()
-        else:
-            msg = bot.send_message(message.chat.id, "❌ Город не найден. Напишите точнее (например: Абинск):")
+        try:
+            loc = geolocator.geocode(message.text.strip())
+            if loc:
+                lat, lon = loc.latitude, loc.longitude
+                city_name = message.text.strip().capitalize()
+            else:
+                msg = bot.send_message(message.chat.id, "❌ Город не найден. Напишите точнее (например: Абинск):", reply_markup=cancel_markup())
+                bot.register_next_step_handler(msg, set_f_loc_step1)
+                return
+        except:
+            msg = bot.send_message(message.chat.id, "❌ Ошибка поиска города. Попробуйте еще раз:", reply_markup=cancel_markup())
             bot.register_next_step_handler(msg, set_f_loc_step1)
             return
+    else:
+        msg = bot.send_message(message.chat.id, "❌ Отправьте геопозицию или напишите название города:", reply_markup=cancel_markup())
+        bot.register_next_step_handler(msg, set_f_loc_step1)
+        return
 
     temp_data[message.chat.id] = {'lat': lat, 'lon': lon, 'city_name': city_name}
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row('50', '100', '200', '500')
+    markup.add('❌ Отмена')
     msg = bot.send_message(message.chat.id, f"📍 Выбран город: **{city_name}**.\nВыберите или введите **радиус поиска в км**:", parse_mode='Markdown', reply_markup=markup)
     bot.register_next_step_handler(msg, set_f_loc_step2)
 
 def set_f_loc_step2(message):
-    if not message.text.isdigit():
+    if check_cancel(message):
+        return
+    if not message.text or not message.text.isdigit():
         msg = bot.send_message(message.chat.id, "❌ Введите радиус цифрами (например: 100):")
         bot.register_next_step_handler(msg, set_f_loc_step2)
         return
@@ -230,71 +362,144 @@ def update_filter_field(user_id, field, value):
 @bot.message_handler(func=lambda m: m.text == '💰 Продать авто')
 def sell_start(message):
     temp_data[message.chat.id] = {'username': message.from_user.username}
-    msg = bot.send_message(message.chat.id, "📸 Отправьте **фотографию** автомобиля:", parse_mode='Markdown', reply_markup=types.ReplyKeyboardRemove())
+    msg = bot.send_message(message.chat.id, "📸 Отправьте **фотографию** автомобиля:", parse_mode='Markdown', reply_markup=cancel_markup())
     bot.register_next_step_handler(msg, get_photo)
 
 def get_photo(message):
+    if check_cancel(message):
+        return
     if not message.photo:
-        msg = bot.send_message(message.chat.id, "❌ Нужно отправить именно фото! Попробуйте еще раз:")
+        msg = bot.send_message(message.chat.id, "❌ Нужно отправить именно фото! Попробуйте еще раз:", reply_markup=cancel_markup())
         bot.register_next_step_handler(msg, get_photo)
         return
     temp_data[message.chat.id]['photo'] = message.photo[-1].file_id
-    msg = bot.send_message(message.chat.id, "🚘 Напишите **марку** авто (например: Лада, Toyota):")
+    msg = bot.send_message(message.chat.id, "🚘 Выберите **марку** авто из списка ниже:", parse_mode='Markdown', reply_markup=build_brands_markup(include_any=False))
     bot.register_next_step_handler(msg, get_brand)
 
 def get_brand(message):
-    temp_data[message.chat.id]['brand'] = message.text.strip()
-    msg = bot.send_message(message.chat.id, "📝 Напишите **модель** авто (например: Приора, Camry):")
+    if check_cancel(message):
+        return
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "❌ Пожалуйста, выберите марку кнопкой:", reply_markup=build_brands_markup(include_any=False))
+        bot.register_next_step_handler(msg, get_brand)
+        return
+    if message.text == '✍️ Другая марка':
+        msg = bot.send_message(message.chat.id, "✍️ Напишите **марку** авто текстом:", parse_mode='Markdown', reply_markup=cancel_markup())
+        bot.register_next_step_handler(msg, get_brand_custom)
+        return
+    brand = message.text.strip()
+    temp_data[message.chat.id]['brand'] = brand
+    msg = bot.send_message(message.chat.id, f"📝 Выберите **модель** {brand} из списка:", parse_mode='Markdown', reply_markup=build_models_markup(brand, include_any=False))
     bot.register_next_step_handler(msg, get_model)
 
+def get_brand_custom(message):
+    if check_cancel(message):
+        return
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "❌ Напишите марку текстом:", reply_markup=cancel_markup())
+        bot.register_next_step_handler(msg, get_brand_custom)
+        return
+    brand = message.text.strip()
+    temp_data[message.chat.id]['brand'] = brand
+    msg = bot.send_message(message.chat.id, f"📝 Напишите **модель** {brand} текстом:", parse_mode='Markdown', reply_markup=cancel_markup())
+    bot.register_next_step_handler(msg, get_model_custom)
+
 def get_model(message):
+    if check_cancel(message):
+        return
+    if not message.text:
+        brand = temp_data[message.chat.id].get('brand', '')
+        msg = bot.send_message(message.chat.id, "❌ Пожалуйста, выберите модель кнопкой:", reply_markup=build_models_markup(brand, include_any=False))
+        bot.register_next_step_handler(msg, get_model)
+        return
+    if message.text == '✍️ Другая модель':
+        msg = bot.send_message(message.chat.id, "✍️ Напишите **модель** авто текстом:", parse_mode='Markdown', reply_markup=cancel_markup())
+        bot.register_next_step_handler(msg, get_model_custom)
+        return
     temp_data[message.chat.id]['model'] = message.text.strip()
-    msg = bot.send_message(message.chat.id, "📅 Укажите **год выпуска** (только цифры, например: 2015):")
+    msg = bot.send_message(message.chat.id, "📅 Укажите **год выпуска** (только цифры, например: 2015):", parse_mode='Markdown', reply_markup=cancel_markup())
+    bot.register_next_step_handler(msg, get_year)
+
+def get_model_custom(message):
+    if check_cancel(message):
+        return
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "❌ Напишите модель текстом:", reply_markup=cancel_markup())
+        bot.register_next_step_handler(msg, get_model_custom)
+        return
+    temp_data[message.chat.id]['model'] = message.text.strip()
+    msg = bot.send_message(message.chat.id, "📅 Укажите **год выпуска** (только цифры, например: 2015):", parse_mode='Markdown', reply_markup=cancel_markup())
     bot.register_next_step_handler(msg, get_year)
 
 def get_year(message):
-    if not message.text.isdigit():
-        msg = bot.send_message(message.chat.id, "❌ Введите год цифрами (например: 2012):")
+    if check_cancel(message):
+        return
+    if not message.text or not message.text.isdigit():
+        msg = bot.send_message(message.chat.id, "❌ Введите год цифрами (например: 2012):", reply_markup=cancel_markup())
         bot.register_next_step_handler(msg, get_year)
         return
     temp_data[message.chat.id]['year'] = int(message.text)
-    msg = bot.send_message(message.chat.id, "💵 Укажите **цену в рублях** (только цифры, например: 450000):")
+    msg = bot.send_message(message.chat.id, "💵 Укажите **цену в рублях** (только цифры, например: 450000):", parse_mode='Markdown', reply_markup=cancel_markup())
     bot.register_next_step_handler(msg, get_price)
 
 def get_price(message):
-    if not message.text.isdigit():
-        msg = bot.send_message(message.chat.id, "❌ Введите цену только цифрами без пробелов:")
+    if check_cancel(message):
+        return
+    if not message.text or not message.text.isdigit():
+        msg = bot.send_message(message.chat.id, "❌ Введите цену только цифрами без пробелов:", reply_markup=cancel_markup())
         bot.register_next_step_handler(msg, get_price)
         return
     temp_data[message.chat.id]['price'] = int(message.text)
     
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row('Отличное / Не требует вложений', 'На ходу / Есть нюансы')
-    markup.row('Требует ремонта / Битая')
-    msg = bot.send_message(message.chat.id, "🛠 Выберите **состояние** автомобиля:", reply_markup=markup)
+    markup.row('Требует ремонта / Битая', '❌ Отмена')
+    msg = bot.send_message(message.chat.id, "🛠 Выберите **состояние** автомобиля:", parse_mode='Markdown', reply_markup=markup)
     bot.register_next_step_handler(msg, get_condition)
 
 def get_condition(message):
+    if check_cancel(message):
+        return
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "❌ Выберите состояние кнопкой:")
+        bot.register_next_step_handler(msg, get_condition)
+        return
     temp_data[message.chat.id]['condition'] = message.text.strip()
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.row('✅ Чистые (без проблем)', '⚠️ Есть проблемы (запрет, утиль, без ПТС)')
-    msg = bot.send_message(message.chat.id, "📄 Что с **документами**?", reply_markup=markup)
+    markup.add('❌ Отмена')
+    msg = bot.send_message(message.chat.id, "📄 Что с **документами**?", parse_mode='Markdown', reply_markup=markup)
     bot.register_next_step_handler(msg, get_docs)
 
 def get_docs(message):
+    if check_cancel(message):
+        return
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "❌ Выберите статус документов кнопкой:")
+        bot.register_next_step_handler(msg, get_docs)
+        return
     temp_data[message.chat.id]['docs'] = message.text.strip()
-    msg = bot.send_message(message.chat.id, "✍️ Напишите **описание** (двигатель, коробка, косяки, торг):", reply_markup=types.ReplyKeyboardRemove())
+    msg = bot.send_message(message.chat.id, "✍️ Напишите **описание** (двигатель, коробка, косяки, торг):", parse_mode='Markdown', reply_markup=cancel_markup())
     bot.register_next_step_handler(msg, get_desc)
 
 def get_desc(message):
+    if check_cancel(message):
+        return
+    if not message.text:
+        msg = bot.send_message(message.chat.id, "❌ Напишите описание текстом:", reply_markup=cancel_markup())
+        bot.register_next_step_handler(msg, get_desc)
+        return
     temp_data[message.chat.id]['description'] = message.text.strip()
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     btn_geo = types.KeyboardButton("📍 Отправить мою геопозицию", request_location=True)
     markup.add(btn_geo)
-    msg = bot.send_message(message.chat.id, "🌍 Нажмите кнопку ниже, чтобы отправить **геопозицию** авто, или напишите **название города** текстом (например: Абинск):", reply_markup=markup)
+    markup.add('❌ Отмена')
+    msg = bot.send_message(message.chat.id, "🌍 Нажмите кнопку ниже, чтобы отправить **геопозицию** авто, или напишите **название города** текстом (например: Абинск):", parse_mode='Markdown', reply_markup=markup)
     bot.register_next_step_handler(msg, get_location_sell)
 
 def get_location_sell(message):
+    if check_cancel(message):
+        return
     lat, lon, city_name = None, None, "Не указан"
     if message.location:
         lat, lon = message.location.latitude, message.location.longitude
@@ -310,13 +515,17 @@ def get_location_sell(message):
                 lat, lon = loc.latitude, loc.longitude
                 city_name = message.text.strip().capitalize()
             else:
-                msg = bot.send_message(message.chat.id, "❌ Город не найден. Напишите точнее (например: Краснодарский край, Абинск):")
+                msg = bot.send_message(message.chat.id, "❌ Город не найден. Напишите точнее (например: Краснодарский край, Абинск):", reply_markup=cancel_markup())
                 bot.register_next_step_handler(msg, get_location_sell)
                 return
         except:
-            msg = bot.send_message(message.chat.id, "❌ Ошибка поиска города. Попробуйте отправить геопозицию кнопкой:")
+            msg = bot.send_message(message.chat.id, "❌ Ошибка поиска города. Попробуйте отправить геопозицию кнопкой:", reply_markup=cancel_markup())
             bot.register_next_step_handler(msg, get_location_sell)
             return
+    else:
+        msg = bot.send_message(message.chat.id, "❌ Отправьте геопозицию кнопкой или напишите город текстом:")
+        bot.register_next_step_handler(msg, get_location_sell)
+        return
 
     d = temp_data[message.chat.id]
     conn = sqlite3.connect('cars.db')
@@ -338,7 +547,6 @@ def buy_cars(message):
 
 def show_next_car(user_id):
     f = get_user_filter(user_id)
-    # f: 0:user_id, 1:brand, 2:model, 3:year_from, 4:year_to, 5:price_from, 6:price_to, 7:city_name, 8:lat, 9:lon, 10:radius, 11:docs
     _, f_brand, f_model, y_from, y_to, p_from, p_to, city_name, u_lat, u_lon, radius, only_clean = f
 
     conn = sqlite3.connect('cars.db')
@@ -364,7 +572,6 @@ def show_next_car(user_id):
     found_car = None
     dist_text = ""
     for car in cars:
-        # car: 0:id, 1:uid, 2:uname, 3:photo, 4:brand, 5:model, 6:year, 7:price, 8:cond, 9:docs, 10:desc, 11:city, 12:lat, 13:lon
         if city_name == 'Не задан' or not u_lat or not u_lon:
             found_car = car
             dist_text = f"📍 Город: {car[11]}"
@@ -415,20 +622,26 @@ def handle_callbacks(call):
     if call.data == "open_filters":
         send_filter_menu(cid)
     elif call.data == "f_brand":
-        msg = bot.send_message(cid, "🚘 Введите желаемую **марку** (или напишите `Любая` для сброса):", parse_mode='Markdown')
+        msg = bot.send_message(cid, "🚘 Выберите желаемую **марку** из списка:", parse_mode='Markdown', reply_markup=build_brands_markup(include_any=True))
         bot.register_next_step_handler(msg, set_f_brand)
     elif call.data == "f_model":
-        msg = bot.send_message(cid, "📝 Введите желаемую **модель** (или напишите `Любая` для сброса):", parse_mode='Markdown')
-        bot.register_next_step_handler(msg, set_f_model)
+        f = get_user_filter(cid)
+        if f[1] == 'Любая':
+            msg = bot.send_message(cid, "📝 Сначала выберите марку или напишите желаемую **модель** текстом (либо `Любая`):", parse_mode='Markdown', reply_markup=cancel_markup())
+            bot.register_next_step_handler(msg, set_f_model)
+        else:
+            msg = bot.send_message(cid, f"📝 Выберите **модель** {f[1]} из списка:", parse_mode='Markdown', reply_markup=build_models_markup(f[1], include_any=True))
+            bot.register_next_step_handler(msg, set_f_model)
     elif call.data == "f_year":
-        msg = bot.send_message(cid, "📅 Введите **год от и до** через пробел (например: `2008 2018`):", parse_mode='Markdown')
+        msg = bot.send_message(cid, "📅 Введите **год от и до** через пробел (например: `2008 2018`):", parse_mode='Markdown', reply_markup=cancel_markup())
         bot.register_next_step_handler(msg, set_f_year)
     elif call.data == "f_price":
-        msg = bot.send_message(cid, "💰 Введите **цену от и до** в рублях через пробел (например: `200000 700000`):", parse_mode='Markdown')
+        msg = bot.send_message(cid, "💰 Введите **цену от и до** в рублях через пробел (например: `200000 700000`):", parse_mode='Markdown', reply_markup=cancel_markup())
         bot.register_next_step_handler(msg, set_f_price)
     elif call.data == "f_loc":
         markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
         markup.add(types.KeyboardButton("📍 Моя текущая геопозиция", request_location=True))
+        markup.add('❌ Отмена')
         msg = bot.send_message(cid, "🌍 Отправьте вашу **геопозицию** или напишите **город** (например: Абинск):", parse_mode='Markdown', reply_markup=markup)
         bot.register_next_step_handler(msg, set_f_loc_step1)
     elif call.data == "f_docs":
@@ -460,5 +673,5 @@ def handle_callbacks(call):
             bot.send_message(cid, f"📞 Ссылка на профиль продавца: [Написать](tg://user?id={res[1]})", parse_mode='Markdown')
         show_next_car(cid)
 
-print("Бот Автовинчик успешно запущен!")
+print("Бот Avtovinchik с каталогом марок и моделей успешно запущен!")
 bot.polling(none_stop=True)
