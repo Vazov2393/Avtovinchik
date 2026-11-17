@@ -3,6 +3,7 @@ import threading
 from telebot import types
 from config import bot
 from database import init_db, db_exec
+import ban_system
 import handlers_user
 import handlers_buyer
 import handlers_admin
@@ -15,7 +16,6 @@ def check_actuality_worker():
     while True:
         try:
             now = int(time.time())
-            # 1. Удаляем объявления, по которым не ответили за 24 часа
             expired = db_exec(
                 "SELECT id, user_id, brand, model FROM cars WHERE status='approved' AND check_sent_at > 0 AND ? - check_sent_at >= ?",
                 (now, ONE_DAY), "all"
@@ -32,7 +32,6 @@ def check_actuality_worker():
                 except Exception:
                     pass
 
-            # 2. Отправляем запрос актуальности каждые 3 дня
             to_check = db_exec(
                 "SELECT id, user_id, brand, model FROM cars WHERE status='approved' AND check_sent_at = 0 AND published_at > 0 AND ? - published_at >= ?",
                 (now, THREE_DAYS), "all"
