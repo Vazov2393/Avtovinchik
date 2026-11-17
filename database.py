@@ -16,11 +16,27 @@ def db_exec(query, params=(), fetch=None):
 def init_db():
     db_exec("""CREATE TABLE IF NOT EXISTS cars (
         id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT,
-        photos TEXT, brand TEXT, model TEXT, year INTEGER, mileage INTEGER,
-        gearbox TEXT, engine TEXT, price INTEGER, condition TEXT, docs TEXT,
-        description TEXT, city TEXT, lat REAL, lon REAL,
+        photos TEXT, brand TEXT, model TEXT, year INTEGER, mileage INTEGER DEFAULT 0,
+        gearbox TEXT DEFAULT '', engine TEXT DEFAULT '', price INTEGER,
+        condition TEXT, docs TEXT, description TEXT, city TEXT, lat REAL, lon REAL,
         status TEXT DEFAULT 'pending', published_at INTEGER DEFAULT 0,
         check_sent_at INTEGER DEFAULT 0)""")
+
+    car_cols = [r[1] for r in db_exec("PRAGMA table_info(cars)", fetch="all")]
+    migrations_cars = {
+        "photos": "TEXT DEFAULT '[]'",
+        "mileage": "INTEGER DEFAULT 0",
+        "gearbox": "TEXT DEFAULT ''",
+        "engine": "TEXT DEFAULT ''",
+        "published_at": "INTEGER DEFAULT 0",
+        "check_sent_at": "INTEGER DEFAULT 0"
+    }
+    for col, col_type in migrations_cars.items():
+        if col not in car_cols:
+            db_exec(f"ALTER TABLE cars ADD COLUMN {col} {col_type}")
+    if "photo" in car_cols and "photos" in car_cols:
+        db_exec("UPDATE cars SET photos=photo WHERE (photos IS NULL OR photos='' OR photos='[]') AND photo IS NOT NULL")
+
     db_exec("""CREATE TABLE IF NOT EXISTS filters (
         user_id INTEGER PRIMARY KEY, brand TEXT DEFAULT 'Любая', model TEXT DEFAULT 'Любая',
         year_from INTEGER DEFAULT 1970, year_to INTEGER DEFAULT 2030,
@@ -28,6 +44,11 @@ def init_db():
         city_name TEXT DEFAULT 'Не задан', lat REAL, lon REAL,
         radius INTEGER DEFAULT 5000, docs_only_clean INTEGER DEFAULT 0,
         notify INTEGER DEFAULT 1)""")
+
+    flt_cols = [r[1] for r in db_exec("PRAGMA table_info(filters)", fetch="all")]
+    if "notify" not in flt_cols:
+        db_exec("ALTER TABLE filters ADD COLUMN notify INTEGER DEFAULT 1")
+
     db_exec("CREATE TABLE IF NOT EXISTS viewed (user_id INTEGER, car_id INTEGER)")
     db_exec("CREATE TABLE IF NOT EXISTS favorites (user_id INTEGER, car_id INTEGER, PRIMARY KEY (user_id, car_id))")
     db_exec("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
