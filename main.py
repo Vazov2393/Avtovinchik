@@ -1,4 +1,5 @@
 import os
+import json
 import math
 import sqlite3
 import telebot
@@ -10,8 +11,10 @@ TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN") or "ВАШ_ТОК
 MY_ADMIN_ID = 0
 
 bot = telebot.TeleBot(TOKEN)
-geolocator = Nominatim(user_agent="avtovinchik_v6")
-DB = "cars.db"
+geolocator = Nominatim(user_agent="avtovinchik_v7", timeout=5)
+DB_DIR = os.environ.get("DATA_DIR", ".")
+os.makedirs(DB_DIR, exist_ok=True)
+DB = os.path.join(DB_DIR, "cars.db")
 temp = {}
 
 
@@ -29,16 +32,19 @@ def db_exec(query, params=(), fetch=None):
 def init_db():
     db_exec("""CREATE TABLE IF NOT EXISTS cars (
         id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT,
-        photo TEXT, brand TEXT, model TEXT, year INTEGER, price INTEGER,
-        condition TEXT, docs TEXT, description TEXT, city TEXT,
-        lat REAL, lon REAL, status TEXT DEFAULT 'pending')""")
+        photos TEXT, brand TEXT, model TEXT, year INTEGER, mileage INTEGER,
+        gearbox TEXT, engine TEXT, price INTEGER, condition TEXT, docs TEXT,
+        description TEXT, city TEXT, lat REAL, lon REAL,
+        status TEXT DEFAULT 'pending')""")
     db_exec("""CREATE TABLE IF NOT EXISTS filters (
         user_id INTEGER PRIMARY KEY, brand TEXT DEFAULT 'Любая', model TEXT DEFAULT 'Любая',
         year_from INTEGER DEFAULT 1970, year_to INTEGER DEFAULT 2030,
         price_from INTEGER DEFAULT 0, price_to INTEGER DEFAULT 99999999,
         city_name TEXT DEFAULT 'Не задан', lat REAL, lon REAL,
-        radius INTEGER DEFAULT 5000, docs_only_clean INTEGER DEFAULT 0)""")
+        radius INTEGER DEFAULT 5000, docs_only_clean INTEGER DEFAULT 0,
+        notify INTEGER DEFAULT 1)""")
     db_exec("CREATE TABLE IF NOT EXISTS viewed (user_id INTEGER, car_id INTEGER)")
+    db_exec("CREATE TABLE IF NOT EXISTS favorites (user_id INTEGER, car_id INTEGER, PRIMARY KEY (user_id, car_id))")
     db_exec("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
 
 
@@ -66,13 +72,35 @@ def calc_dist(lat1, lon1, lat2, lon2):
     return round(r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
 
 
+def get_photos_list(photos_str):
+    try:
+        res = json.loads(photos_str)
+        return res if isinstance(res, list) else [photos_str]
+    except Exception:
+        return [photos_str] if photos_str else []
+
+
+def send_car_media(chat_id, photos_list, caption, reply_markup=None):
+    if len(photos_list) > 1:
+        media = [types.InputMediaPhoto(p) for p in photos_list[:10]]
+        bot.send_media_group(chat_id, media)
+        return bot.send_message(chat_id, caption, reply_markup=reply_markup)
+    elif len(photos_list) == 1:
+        return bot.send_photo(chat_id, photos_list[0], caption=caption, reply_markup=reply_markup)
+    else:
+        return bot.send_message(chat_id, caption, reply_markup=reply_markup)
+
+
 def format_car(car, dist_str=""):
-    p = f"{car[7]:,}".replace(",", " ")
-    loc = dist_str if dist_str else f"📍 Город: {car[11]}"
+    p = f"{car[10]:,}".replace(",", " ")
+    mil = f"{car[7]:,}".replace(",", " ")
+    loc = dist_str if dist_str else f"📍 Город: {car[14]}"
     return (
         f"🚘 {car[4]} {car[5]}, {car[6]} г.\n"
-        f"💰 Цена: {p} руб.\n{loc}\n"
-        f"🛠 Состояние: {car[8]}\n📄 Документы: {car[9]}\n\n📝 {car[10]}"
+        f"💰 Цена: {p} руб.\n"
+        f"🛣 Пробег: {mil} км | ⚙️ {car[8]} | 🐎 {car[9]}\n"
+        f"{loc}\n"
+        f"🛠 Состояние: {car[11]}\n📄 Документы: {car[12]}\n\n📝 {car[13]}"
     )
 
 
@@ -84,7 +112,8 @@ def format_adm_car(car):
 def main_kb(uid):
     m = types.ReplyKeyboardMarkup(resize_keyboard=True)
     m.row("🚗 Купить авто", "💰 Продать авто")
-    m.row("⚙️ Мой фильтр", "📋 Мои объявления")
+    m.row("⚙️ Мой фильтр", "⭐ Избранное")
+    m.row("📋 Мои объявления")
     if is_admin(uid):
         m.row("👑 Админ-панель")
     return m
@@ -125,9 +154,14 @@ def geo_kb():
     return m
 
 
+def reset_state(uid):
+    bot.clear_step_handler_by_chat_id(uid)
+
+
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
     uid = m.from_user.id
+    reset_state(uid)
     get_filter(uid)
     cnt = db_exec("SELECT COUNT(*) FROM admins", fetch="one")
     if cnt and cnt[0] == 0:
@@ -139,27 +173,45 @@ def cmd_start(m):
 @bot.message_handler(func=lambda m: m.text == "💰 Продать авто")
 def sell_1(m):
     uid = m.from_user.id
-    temp[uid] = {"username": m.from_user.username}
-    msg = bot.send_message(uid, "📸 Шаг 1/9. Отправьте фото авто:", reply_markup=back_kb())
+    reset_state(uid)
+    temp[uid] = {"username": m.from_user.username, "photos": []}
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("✅ Готово (далее)", "⬅️ Назад")
+    msg = bot.send_message(uid, "📸 Шаг 1/12. Отправьте до 10 фото авто (можно по одному или альбомом) и нажмите «✅ Готово (далее)»:", reply_markup=kb)
     bot.register_next_step_handler(msg, sell_2)
 
 
 def sell_2(m):
     uid = m.from_user.id
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("✅ Готово (далее)", "⬅️ Назад")
     if m.text == "⬅️ Назад":
         return bot.send_message(uid, "Главное меню:", reply_markup=main_kb(uid))
-    if not m.photo:
-        msg = bot.send_message(uid, "❌ Отправьте именно фото:", reply_markup=back_kb())
+    if m.text == "✅ Готово (далее)":
+        if not temp.get(uid, {}).get("photos"):
+            msg = bot.send_message(uid, "❌ Сначала загрузите хотя бы одно фото:", reply_markup=kb)
+            return bot.register_next_step_handler(msg, sell_2)
+        msg = bot.send_message(uid, "🚘 Шаг 2/12. Выберите марку из списка или введите вручную:", reply_markup=brands_kb())
+        return bot.register_next_step_handler(msg, sell_3)
+    if m.photo:
+        if len(temp[uid]["photos"]) < 10:
+            temp[uid]["photos"].append(m.photo[-1].file_id)
+            cnt = len(temp[uid]["photos"])
+            msg = bot.send_message(uid, f"📥 Фото добавлено ({cnt}/10). Отправьте еще или нажмите «✅ Готово (далее)»:", reply_markup=kb)
+        else:
+            msg = bot.send_message(uid, "⚠️ Достигнут лимит 10 фото. Нажмите «✅ Готово (далее)»:", reply_markup=kb)
         return bot.register_next_step_handler(msg, sell_2)
-    temp[uid]["photo"] = m.photo[-1].file_id
-    msg = bot.send_message(uid, "🚘 Шаг 2/9. Выберите марку из списка или введите вручную:", reply_markup=brands_kb())
-    bot.register_next_step_handler(msg, sell_3)
+    msg = bot.send_message(uid, "❌ Отправьте фото или нажмите «✅ Готово (далее)»:", reply_markup=kb)
+    bot.register_next_step_handler(msg, sell_2)
 
 
 def sell_3(m):
     uid = m.from_user.id
     if m.text == "⬅️ Назад":
-        msg = bot.send_message(uid, "📸 Шаг 1/9. Отправьте фото авто:", reply_markup=back_kb())
+        temp[uid]["photos"] = []
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.row("✅ Готово (далее)", "⬅️ Назад")
+        msg = bot.send_message(uid, "📸 Шаг 1/12. Загрузите фото заново:", reply_markup=kb)
         return bot.register_next_step_handler(msg, sell_2)
     if not m.text:
         msg = bot.send_message(uid, "❌ Выберите марку кнопкой или напишите текстом:", reply_markup=brands_kb())
@@ -168,14 +220,14 @@ def sell_3(m):
         msg = bot.send_message(uid, "✍️ Напишите название марки:", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_3)
     temp[uid]["brand"] = m.text.strip()
-    msg = bot.send_message(uid, "📝 Шаг 3/9. Выберите модель из списка или введите вручную:", reply_markup=models_kb(temp[uid]["brand"]))
+    msg = bot.send_message(uid, "📝 Шаг 3/12. Выберите модель из списка или введите вручную:", reply_markup=models_kb(temp[uid]["brand"]))
     bot.register_next_step_handler(msg, sell_4)
 
 
 def sell_4(m):
     uid = m.from_user.id
     if m.text == "⬅️ Назад":
-        msg = bot.send_message(uid, "🚘 Шаг 2/9. Выберите марку:", reply_markup=brands_kb())
+        msg = bot.send_message(uid, "🚘 Шаг 2/12. Выберите марку:", reply_markup=brands_kb())
         return bot.register_next_step_handler(msg, sell_3)
     if not m.text:
         msg = bot.send_message(uid, "❌ Выберите модель:", reply_markup=back_kb())
@@ -184,43 +236,88 @@ def sell_4(m):
         msg = bot.send_message(uid, "✍️ Напишите название модели:", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_4)
     temp[uid]["model"] = m.text.strip()
-    msg = bot.send_message(uid, "📅 Шаг 4/9. Введите год выпуска (цифрами):", reply_markup=back_kb())
+    msg = bot.send_message(uid, "📅 Шаг 4/12. Введите год выпуска (например: 2018):", reply_markup=back_kb())
     bot.register_next_step_handler(msg, sell_5)
 
 
 def sell_5(m):
     uid = m.from_user.id
     if m.text == "⬅️ Назад":
-        msg = bot.send_message(uid, "📝 Шаг 3/9. Выберите модель:", reply_markup=models_kb(temp[uid]["brand"]))
+        msg = bot.send_message(uid, "📝 Шаг 3/12. Выберите модель:", reply_markup=models_kb(temp[uid]["brand"]))
         return bot.register_next_step_handler(msg, sell_4)
-    if not m.text or not m.text.strip().isdigit():
-        msg = bot.send_message(uid, "❌ Введите год цифрами:", reply_markup=back_kb())
+    if not m.text or not m.text.strip().isdigit() or not (1950 <= int(m.text.strip()) <= 2027):
+        msg = bot.send_message(uid, "❌ Введите корректный год (от 1950 до 2027):", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_5)
     temp[uid]["year"] = int(m.text.strip())
-    msg = bot.send_message(uid, "💰 Шаг 5/9. Введите цену в рублях (цифрами):", reply_markup=back_kb())
+    msg = bot.send_message(uid, "🛣 Шаг 5/12. Введите пробег в км (цифрами):", reply_markup=back_kb())
+    bot.register_next_step_handler(msg, sell_5_mil)
+
+
+def sell_5_mil(m):
+    uid = m.from_user.id
+    if m.text == "⬅️ Назад":
+        msg = bot.send_message(uid, "📅 Шаг 4/12. Введите год выпуска:", reply_markup=back_kb())
+        return bot.register_next_step_handler(msg, sell_5)
+    if not m.text or not m.text.strip().isdigit() or int(m.text.strip()) < 0:
+        msg = bot.send_message(uid, "❌ Введите пробег цифрами:", reply_markup=back_kb())
+        return bot.register_next_step_handler(msg, sell_5_mil)
+    temp[uid]["mileage"] = int(m.text.strip())
+    kb_g = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb_g.row("Механика", "Автомат")
+    kb_g.row("Робот", "Вариатор")
+    kb_g.row("⬅️ Назад")
+    msg = bot.send_message(uid, "⚙️ Шаг 6/12. Выберите тип КПП:", reply_markup=kb_g)
+    bot.register_next_step_handler(msg, sell_5_gb)
+
+
+def sell_5_gb(m):
+    uid = m.from_user.id
+    if m.text == "⬅️ Назад":
+        msg = bot.send_message(uid, "🛣 Шаг 5/12. Введите пробег:", reply_markup=back_kb())
+        return bot.register_next_step_handler(msg, sell_5_mil)
+    if not m.text:
+        return
+    temp[uid]["gearbox"] = m.text.strip()
+    msg = bot.send_message(uid, "🐎 Шаг 7/12. Укажите объем и тип двигателя (например: 1.6 бензин, 106 л.с.):", reply_markup=back_kb())
+    bot.register_next_step_handler(msg, sell_5_eng)
+
+
+def sell_5_eng(m):
+    uid = m.from_user.id
+    if m.text == "⬅️ Назад":
+        kb_g = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        kb_g.row("Механика", "Автомат")
+        kb_g.row("Робот", "Вариатор")
+        kb_g.row("⬅️ Назад")
+        msg = bot.send_message(uid, "⚙️ Шаг 6/12. Выберите тип КПП:", reply_markup=kb_g)
+        return bot.register_next_step_handler(msg, sell_5_gb)
+    if not m.text:
+        return
+    temp[uid]["engine"] = m.text.strip()
+    msg = bot.send_message(uid, "💰 Шаг 8/12. Введите цену в рублях (цифрами):", reply_markup=back_kb())
     bot.register_next_step_handler(msg, sell_6)
 
 
 def sell_6(m):
     uid = m.from_user.id
     if m.text == "⬅️ Назад":
-        msg = bot.send_message(uid, "📅 Шаг 4/9. Введите год:", reply_markup=back_kb())
-        return bot.register_next_step_handler(msg, sell_5)
-    if not m.text or not m.text.strip().isdigit():
-        msg = bot.send_message(uid, "❌ Введите цену цифрами:", reply_markup=back_kb())
+        msg = bot.send_message(uid, "🐎 Шаг 7/12. Укажите двигатель:", reply_markup=back_kb())
+        return bot.register_next_step_handler(msg, sell_5_eng)
+    if not m.text or not m.text.strip().isdigit() or int(m.text.strip()) < 1000:
+        msg = bot.send_message(uid, "❌ Введите реальную цену в рублях (от 1000):", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_6)
     temp[uid]["price"] = int(m.text.strip())
     kb_c = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb_c.row("Отличное", "На ходу / Есть нюансы")
     kb_c.row("Требует ремонта / Битая", "⬅️ Назад")
-    msg = bot.send_message(uid, "🛠 Шаг 6/9. Выберите состояние:", reply_markup=kb_c)
+    msg = bot.send_message(uid, "🛠 Шаг 9/12. Выберите состояние:", reply_markup=kb_c)
     bot.register_next_step_handler(msg, sell_7)
 
 
 def sell_7(m):
     uid = m.from_user.id
     if m.text == "⬅️ Назад":
-        msg = bot.send_message(uid, "💰 Шаг 5/9. Введите цену:", reply_markup=back_kb())
+        msg = bot.send_message(uid, "💰 Шаг 8/12. Введите цену:", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_6)
     if not m.text:
         return
@@ -228,7 +325,7 @@ def sell_7(m):
     kb_d = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb_d.row("✅ Чистые (без проблем)", "⚠️ Есть проблемы")
     kb_d.row("⬅️ Назад")
-    msg = bot.send_message(uid, "📄 Шаг 7/9. Что с документами?", reply_markup=kb_d)
+    msg = bot.send_message(uid, "📄 Шаг 10/12. Что с документами?", reply_markup=kb_d)
     bot.register_next_step_handler(msg, sell_8)
 
 
@@ -238,12 +335,12 @@ def sell_8(m):
         kb_c = types.ReplyKeyboardMarkup(resize_keyboard=True)
         kb_c.row("Отличное", "На ходу / Есть нюансы")
         kb_c.row("Требует ремонта / Битая", "⬅️ Назад")
-        msg = bot.send_message(uid, "🛠 Шаг 6/9. Выберите состояние:", reply_markup=kb_c)
+        msg = bot.send_message(uid, "🛠 Шаг 9/12. Выберите состояние:", reply_markup=kb_c)
         return bot.register_next_step_handler(msg, sell_7)
     if not m.text:
         return
     temp[uid]["docs"] = m.text.strip()
-    msg = bot.send_message(uid, "✍️ Шаг 8/9. Напишите описание авто:", reply_markup=back_kb())
+    msg = bot.send_message(uid, "✍️ Шаг 11/12. Напишите описание авто:", reply_markup=back_kb())
     bot.register_next_step_handler(msg, sell_9)
 
 
@@ -253,20 +350,20 @@ def sell_9(m):
         kb_d = types.ReplyKeyboardMarkup(resize_keyboard=True)
         kb_d.row("✅ Чистые (без проблем)", "⚠️ Есть проблемы")
         kb_d.row("⬅️ Назад")
-        msg = bot.send_message(uid, "📄 Шаг 7/9. Что с документами?", reply_markup=kb_d)
+        msg = bot.send_message(uid, "📄 Шаг 10/12. Что с документами?", reply_markup=kb_d)
         return bot.register_next_step_handler(msg, sell_8)
     if not m.text:
         msg = bot.send_message(uid, "❌ Напишите описание текстом:", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_9)
     temp[uid]["desc"] = m.text.strip()
-    msg = bot.send_message(uid, "🌍 Шаг 9/9. Отправьте геопозицию или напишите город (например: Абинск):", reply_markup=geo_kb())
+    msg = bot.send_message(uid, "🌍 Шаг 12/12. Отправьте геопозицию или напишите город:", reply_markup=geo_kb())
     bot.register_next_step_handler(msg, sell_10)
 
 
 def sell_10(m):
     uid = m.from_user.id
     if m.text == "⬅️ Назад":
-        msg = bot.send_message(uid, "✍️ Шаг 8/9. Напишите описание:", reply_markup=back_kb())
+        msg = bot.send_message(uid, "✍️ Шаг 11/12. Напишите описание:", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_9)
     lat, lon, city = None, None, "Не указан"
     if m.location:
@@ -283,10 +380,10 @@ def sell_10(m):
             if loc:
                 lat, lon, city = loc.latitude, loc.longitude, m.text.strip().capitalize()
             else:
-                msg = bot.send_message(uid, "❌ Город не найден. Введите точнее:", reply_markup=geo_kb())
+                msg = bot.send_message(uid, "❌ Город не найден. Введите точнее или отправьте геопозицию:", reply_markup=geo_kb())
                 return bot.register_next_step_handler(msg, sell_10)
         except Exception:
-            msg = bot.send_message(uid, "❌ Ошибка поиска. Отправьте геопозицию кнопкой:", reply_markup=geo_kb())
+            msg = bot.send_message(uid, "❌ Сервис карт временно недоступен. Отправьте геопозицию кнопкой:", reply_markup=geo_kb())
             return bot.register_next_step_handler(msg, sell_10)
     else:
         return
@@ -299,36 +396,33 @@ def show_preview(uid):
     if not d:
         return
     p = f"{d['price']:,}".replace(",", " ")
+    mil = f"{d['mileage']:,}".replace(",", " ")
     cap = (
         f"👀 ПРЕДПРОСМОТР ОБЪЯВЛЕНИЯ\n\n"
-        f"🚘 {d['brand']} {d['model']}, {d['year']} г.\n💰 Цена: {p} руб.\n"
+        f"🚘 {d['brand']} {d['model']}, {d['year']} г.\n"
+        f"💰 Цена: {p} руб.\n"
+        f"🛣 Пробег: {mil} км | ⚙️ {d['gearbox']} | 🐎 {d['engine']}\n"
         f"📍 Город: {d['city']}\n🛠 Состояние: {d['condition']}\n"
         f"📄 Документы: {d['docs']}\n\n📝 {d['desc']}"
     )
     mk = types.InlineKeyboardMarkup()
     mk.row(types.InlineKeyboardButton("✅ Отправить на модерацию", callback_data="prev_ok"))
     mk.row(
-        types.InlineKeyboardButton("📸 Фото", callback_data="prev_ph"),
         types.InlineKeyboardButton("💰 Цена", callback_data="prev_pr"),
         types.InlineKeyboardButton("✍️ Описание", callback_data="prev_ds")
     )
     mk.row(types.InlineKeyboardButton("❌ Отменить", callback_data="prev_no"))
     bot.send_message(uid, "Проверьте карточку перед отправкой:", reply_markup=main_kb(uid))
-    bot.send_photo(uid, d["photo"], caption=cap, reply_markup=mk)
+    send_car_media(uid, d["photos"], cap, mk)
 
 
 def prev_edit(m, field):
     uid = m.from_user.id
     if m.text == "⬅️ Назад":
         return show_preview(uid)
-    if field == "photo":
-        if not m.photo:
-            msg = bot.send_message(uid, "❌ Отправьте фото:", reply_markup=back_kb())
-            return bot.register_next_step_handler(msg, prev_edit, "photo")
-        temp[uid]["photo"] = m.photo[-1].file_id
-    elif field == "price":
-        if not m.text or not m.text.strip().isdigit():
-            msg = bot.send_message(uid, "❌ Введите цену цифрами:", reply_markup=back_kb())
+    if field == "price":
+        if not m.text or not m.text.strip().isdigit() or int(m.text.strip()) < 1000:
+            msg = bot.send_message(uid, "❌ Введите цену цифрами (от 1000):", reply_markup=back_kb())
             return bot.register_next_step_handler(msg, prev_edit, "price")
         temp[uid]["price"] = int(m.text.strip())
     elif field == "desc":
@@ -342,6 +436,7 @@ def prev_edit(m, field):
 @bot.message_handler(func=lambda m: m.text == "📋 Мои объявления")
 def my_cars(m):
     uid = m.from_user.id
+    reset_state(uid)
     cars = db_exec("SELECT * FROM cars WHERE user_id=? ORDER BY id DESC", (uid,), "all")
     if not cars:
         return bot.send_message(uid, "У вас нет объявлений.", reply_markup=main_kb(uid))
@@ -349,28 +444,21 @@ def my_cars(m):
     for c in cars:
         mk = types.InlineKeyboardMarkup()
         mk.row(
-            types.InlineKeyboardButton("📸 Фото", callback_data=f"my_ph_{c[0]}"),
             types.InlineKeyboardButton("💰 Цена", callback_data=f"my_pr_{c[0]}"),
             types.InlineKeyboardButton("📝 Описание", callback_data=f"my_ds_{c[0]}")
         )
         mk.row(types.InlineKeyboardButton("🗑 Снять с продажи", callback_data=f"my_dl_{c[0]}"))
-        bot.send_photo(uid, c[3], caption=f"Статус: {st_map.get(c[14], c[14])}\n\n" + format_car(c), reply_markup=mk)
+        photos = get_photos_list(c[3])
+        send_car_media(uid, photos, f"Статус: {st_map.get(c[17], c[17])}\n\n" + format_car(c), mk)
 
 
 def my_edit_step(m, cid, field):
     uid = m.from_user.id
     if m.text == "⬅️ Назад":
         return bot.send_message(uid, "Отменено.", reply_markup=main_kb(uid))
-    if field == "photo":
-        if not m.photo:
-            msg = bot.send_message(uid, "❌ Отправьте фото:", reply_markup=back_kb())
-            return bot.register_next_step_handler(msg, my_edit_step, cid, "photo")
-        db_exec("UPDATE cars SET photo=?, status='pending' WHERE id=?", (m.photo[-1].file_id, cid))
-        bot.send_message(uid, "✅ Фото обновлено и отправлено на проверку!", reply_markup=main_kb(uid))
-        notify_admins(cid)
-    elif field == "price":
-        if not m.text or not m.text.strip().isdigit():
-            msg = bot.send_message(uid, "❌ Введите цену цифрами:", reply_markup=back_kb())
+    if field == "price":
+        if not m.text or not m.text.strip().isdigit() or int(m.text.strip()) < 1000:
+            msg = bot.send_message(uid, "❌ Введите цену цифрами (от 1000):", reply_markup=back_kb())
             return bot.register_next_step_handler(msg, my_edit_step, cid, "price")
         db_exec("UPDATE cars SET price=? WHERE id=?", (int(m.text.strip()), cid))
         bot.send_message(uid, "✅ Цена обновлена!", reply_markup=main_kb(uid))
@@ -395,32 +483,86 @@ def notify_admins(cid):
     adms = [r[0] for r in db_exec("SELECT user_id FROM admins", fetch="all")]
     if MY_ADMIN_ID and MY_ADMIN_ID not in adms:
         adms.append(MY_ADMIN_ID)
+    photos = get_photos_list(car[3])
     for a in adms:
         try:
-            bot.send_photo(a, car[3], caption="⏳ НОВОЕ НА МОДЕРАЦИЮ\n\n" + format_adm_car(car), reply_markup=mk)
+            send_car_media(a, photos, "⏳ НОВОЕ НА МОДЕРАЦИЮ\n\n" + format_adm_car(car), mk)
         except Exception:
             pass
+
+
+def notify_subscribers(car):
+    filters = db_exec("SELECT * FROM filters WHERE notify=1 AND user_id!=?", (car[1],), "all")
+    photos = get_photos_list(car[3])
+    for f in filters:
+        if not (f[3] <= car[6] <= f[4] and f[5] <= car[10] <= f[6]):
+            continue
+        if f[1] != "Любая" and f[1].lower() not in car[4].lower():
+            continue
+        if f[2] != "Любая" and f[2].lower() not in car[5].lower():
+            continue
+        if f[11] == 1 and "Чистые" not in car[12]:
+            continue
+        d_str = ""
+        if f[7] != "Не задан" and f[8] and f[9]:
+            if not (car[15] and car[16]):
+                continue
+            dist = calc_dist(f[8], f[9], car[15], car[16])
+            if dist > f[10]:
+                continue
+            d_str = f"📍 Город: {car[14]} (~{dist} км от вас)"
+        mk = types.InlineKeyboardMarkup()
+        mk.row(
+            types.InlineKeyboardButton("❤️ Контакт", callback_data=f"lk_{car[0]}"),
+            types.InlineKeyboardButton("⭐ В избранное", callback_data=f"fav_{car[0]}")
+        )
+        try:
+            send_car_media(f[0], photos, "🔔 НОВОЕ АВТО ПО ВАШЕМУ ФИЛЬТРУ!\n\n" + format_car(car, d_str), mk)
+        except Exception:
+            pass
+
+
+# --- ИЗБРАННОЕ ---
+@bot.message_handler(func=lambda m: m.text == "⭐ Избранное")
+def fav_list(m):
+    uid = m.from_user.id
+    reset_state(uid)
+    rows = db_exec("SELECT c.* FROM cars c JOIN favorites f ON c.id=f.car_id WHERE f.user_id=? AND c.status='approved'", (uid,), "all")
+    if not rows:
+        return bot.send_message(uid, "В избранном пока пусто.", reply_markup=main_kb(uid))
+    for c in rows:
+        mk = types.InlineKeyboardMarkup()
+        if c[2]:
+            mk.row(types.InlineKeyboardButton("📞 Написать продавцу", url=f"https://t.me/{c[2]}"))
+        else:
+            mk.row(types.InlineKeyboardButton("📞 Профиль продавца", url=f"tg://user?id={c[1]}"))
+        mk.row(types.InlineKeyboardButton("❌ Убрать из избранного", callback_data=f"unfav_{c[0]}"))
+        send_car_media(uid, get_photos_list(c[3]), format_car(c), mk)
 
 
 # --- ФИЛЬТР И ЛЕНТА ---
 @bot.message_handler(func=lambda m: m.text == "⚙️ Мой фильтр")
 def flt_menu(m):
+    reset_state(m.from_user.id)
     send_flt(m.from_user.id)
 
 
 def send_flt(uid, mid=None):
     f = get_filter(uid)
     docs = "Только чистые" if f[11] == 1 else "Все"
+    ntf = "Вкл 🔔" if f[12] == 1 else "Выкл 🔕"
     loc = f"{f[7]} (+{f[10]} км)" if f[7] != "Не задан" else "Вся Россия"
     pto = "без потолка" if f[6] >= 99999999 else f"{f[6]:,}".replace(",", " ") + " руб."
     txt = (
         f"⚙️ Фильтры поиска:\n\n🚘 Марка: {f[1]}\n📝 Модель: {f[2]}\n"
-        f"📅 Год: {f[3]} - {f[4]}\n💰 Цена: {f[5]} - {pto}\n📍 Локация: {loc}\n📄 Документы: {docs}"
+        f"📅 Год: {f[3]} - {f[4]}\n💰 Цена: {f[5]} - {pto}\n📍 Локация: {loc}\n"
+        f"📄 Документы: {docs}\n🔔 Уведомления о новинках: {ntf}"
     )
     mk = types.InlineKeyboardMarkup()
     mk.row(types.InlineKeyboardButton(f"🚘 Марка: {f[1]}", callback_data="fb"), types.InlineKeyboardButton(f"📝 Модель: {f[2]}", callback_data="fm"))
     mk.row(types.InlineKeyboardButton(f"📅 Год: {f[3]}-{f[4]}", callback_data="fy"), types.InlineKeyboardButton("💰 Цена от/до", callback_data="fp"))
     mk.row(types.InlineKeyboardButton("📍 Локация", callback_data="fl"), types.InlineKeyboardButton("📄 Документы", callback_data="fd"))
+    mk.row(types.InlineKeyboardButton(f"🔔 Уведомления: {ntf}", callback_data="fn"))
     mk.row(types.InlineKeyboardButton("🔄 Сбросить", callback_data="fr"), types.InlineKeyboardButton("🔍 Показать авто", callback_data="fs"))
     if mid:
         try:
@@ -464,11 +606,15 @@ def flt_step(m, mode):
         if m.location:
             lat, lon = m.location.latitude, m.location.longitude
         elif m.text:
-            loc = geolocator.geocode(m.text.strip())
-            if not loc:
-                msg = bot.send_message(uid, "❌ Город не найден:", reply_markup=geo_kb())
+            try:
+                loc = geolocator.geocode(m.text.strip())
+                if not loc:
+                    msg = bot.send_message(uid, "❌ Город не найден. Введите точнее или отправьте геопозицию:", reply_markup=geo_kb())
+                    return bot.register_next_step_handler(msg, flt_step, "loc1")
+                lat, lon, city = loc.latitude, loc.longitude, m.text.strip().capitalize()
+            except Exception:
+                msg = bot.send_message(uid, "❌ Ошибка геокодера. Отправьте геопозицию кнопкой:", reply_markup=geo_kb())
                 return bot.register_next_step_handler(msg, flt_step, "loc1")
-            lat, lon, city = loc.latitude, loc.longitude, m.text.strip().capitalize()
         else:
             return
         temp[uid] = {"lat": lat, "lon": lon, "city": city}
@@ -490,6 +636,7 @@ def flt_step(m, mode):
 
 @bot.message_handler(func=lambda m: m.text == "🚗 Купить авто")
 def buy_start(m):
+    reset_state(m.from_user.id)
     next_car(m.from_user.id)
 
 
@@ -511,20 +658,28 @@ def next_car(uid):
         if f[7] == "Не задан" or not f[8] or not f[9]:
             found = c
             break
-        elif c[12] and c[13]:
-            dist = calc_dist(f[8], f[9], c[12], c[13])
+        elif c[15] and c[16]:
+            dist = calc_dist(f[8], f[9], c[15], c[16])
             if dist <= f[10]:
-                found, d_str = c, f"📍 Город: {c[11]} (~{dist} км от вас)"
+                found, d_str = c, f"📍 Город: {c[14]} (~{dist} км от вас)"
                 break
     if not found:
         mk = types.InlineKeyboardMarkup()
-        mk.add(types.InlineKeyboardButton("⚙️ Изменить фильтр", callback_data="open_f"))
+        mk.row(types.InlineKeyboardButton("🔄 Смотреть заново", callback_data="reset_v"))
+        mk.row(types.InlineKeyboardButton("⚙️ Изменить фильтр", callback_data="open_f"))
         return bot.send_message(uid, "🏁 Подходящих авто больше нет!", reply_markup=mk)
     db_exec("INSERT INTO viewed VALUES (?, ?)", (uid, found[0]))
     mk = types.InlineKeyboardMarkup()
-    mk.row(types.InlineKeyboardButton("❤️ Контакт", callback_data=f"lk_{found[0]}"), types.InlineKeyboardButton("👎 Дальше", callback_data="nx"))
-    mk.row(types.InlineKeyboardButton("⚙️ Фильтр", callback_data="open_f"), types.InlineKeyboardButton("🚩 Пожаловаться", callback_data=f"rp_{found[0]}"))
-    bot.send_photo(uid, found[3], caption=format_car(found, d_str), reply_markup=mk)
+    mk.row(
+        types.InlineKeyboardButton("❤️ Контакт", callback_data=f"lk_{found[0]}"),
+        types.InlineKeyboardButton("👎 Дальше", callback_data="nx")
+    )
+    mk.row(
+        types.InlineKeyboardButton("⭐ В избранное", callback_data=f"fav_{found[0]}"),
+        types.InlineKeyboardButton("⚙️ Фильтр", callback_data="open_f")
+    )
+    mk.row(types.InlineKeyboardButton("🚩 Пожаловаться", callback_data=f"rp_{found[0]}"))
+    send_car_media(uid, get_photos_list(found[3]), format_car(found, d_str), mk)
 
 
 def rep_step(m, cid):
@@ -541,7 +696,7 @@ def rep_step(m, cid):
             adms.append(MY_ADMIN_ID)
         for a in adms:
             try:
-                bot.send_photo(a, car[3], caption=f"🚩 ЖАЛОБА ОТ ID {uid}\nПричина: {m.text}\n\n" + format_adm_car(car), reply_markup=mk)
+                send_car_media(a, get_photos_list(car[3]), f"🚩 ЖАЛОБА ОТ ID {uid}\nПричина: {m.text}\n\n" + format_adm_car(car), mk)
             except Exception:
                 pass
     bot.send_message(uid, "✅ Жалоба отправлена админам!", reply_markup=main_kb(uid))
@@ -553,6 +708,7 @@ def rep_step(m, cid):
 @bot.message_handler(func=lambda m: m.text == "👑 Админ-панель")
 def adm_panel(m):
     uid = m.from_user.id
+    reset_state(uid)
     cnt = db_exec("SELECT COUNT(*) FROM admins", fetch="one")
     if cnt and cnt[0] == 0:
         db_exec("INSERT OR IGNORE INTO admins VALUES (?)", (uid,))
@@ -575,7 +731,7 @@ def adm_mod_next(uid):
     mk = types.InlineKeyboardMarkup()
     mk.row(types.InlineKeyboardButton("✅ Одобрить", callback_data=f"adm_ok_{car[0]}"))
     mk.row(types.InlineKeyboardButton("⚠️ Предупреждение", callback_data=f"adm_wr_{car[0]}"), types.InlineKeyboardButton("🗑 Удалить", callback_data=f"adm_dl_{car[0]}_mod"))
-    bot.send_photo(uid, car[3], caption="⏳ ПРОВЕРКА\n\n" + format_adm_car(car), reply_markup=mk)
+    send_car_media(uid, get_photos_list(car[3]), "⏳ ПРОВЕРКА\n\n" + format_adm_car(car), mk)
 
 
 def adm_browse(uid, idx=0):
@@ -587,9 +743,8 @@ def adm_browse(uid, idx=0):
     mk = types.InlineKeyboardMarkup()
     if len(cars) > 1:
         mk.row(types.InlineKeyboardButton("⬅️ Пред.", callback_data=f"adm_br_{idx - 1}"), types.InlineKeyboardButton("След. ➡️", callback_data=f"adm_br_{idx + 1}"))
-    mk.row(types.InlineKeyboardButton("📞 Автор", callback_data=f"adm_cn_{c[0]}"), types.InlineKeyboardButton("⚠️ Предупреждение", callback_data=f"adm_wr_{c[0]}"))
-    mk.row(types.InlineKeyboardButton("🗑 Удалить", callback_data=f"adm_dl_{c[0]}_all"))
-    bot.send_photo(uid, c[3], caption=f"📋 ({idx + 1}/{len(cars)})\n\n" + format_adm_car(c), reply_markup=mk)
+    mk.row(types.InlineKeyboardButton("⚠️ Предупреждение", callback_data=f"adm_wr_{c[0]}"), types.InlineKeyboardButton("🗑 Удалить", callback_data=f"adm_dl_{c[0]}_all"))
+    send_car_media(uid, get_photos_list(c[3]), f"📋 ({idx + 1}/{len(cars)})\n\n" + format_adm_car(c), mk)
 
 
 def adm_action_step(m, mode, cid=None):
@@ -609,6 +764,7 @@ def adm_action_step(m, mode, cid=None):
         if car:
             db_exec("DELETE FROM cars WHERE id=?", (cid,))
             db_exec("DELETE FROM viewed WHERE car_id=?", (cid,))
+            db_exec("DELETE FROM favorites WHERE car_id=?", (cid,))
             try:
                 bot.send_message(car[1], f"🗑 ВАШЕ ОБЪЯВЛЕНИЕ УДАЛЕНО\nАвто: {car[4]} {car[5]}\nПричина: {m.text}")
             except Exception:
@@ -636,14 +792,15 @@ def cb_all(call):
         info = temp.pop(uid, None)
         if not info:
             return
-        cid = db_exec("INSERT INTO cars (user_id, username, photo, brand, model, year, price, condition, docs, description, city, lat, lon) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                      (uid, info["username"], info["photo"], info["brand"], info["model"], info["year"], info["price"], info["condition"], info["docs"], info["desc"], info["city"], info["lat"], info["lon"]), "id")
+        photos_json = json.dumps(info["photos"])
+        cid = db_exec(
+            "INSERT INTO cars (user_id, username, photos, brand, model, year, mileage, gearbox, engine, price, condition, docs, description, city, lat, lon) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (uid, info["username"], photos_json, info["brand"], info["model"], info["year"], info["mileage"], info["gearbox"], info["engine"], info["price"], info["condition"], info["docs"], info["desc"], info["city"], info["lat"], info["lon"]),
+            "id"
+        )
         bot.delete_message(uid, call.message.message_id)
         bot.send_message(uid, "✅ Отправлено на модерацию!", reply_markup=main_kb(uid))
         notify_admins(cid)
-    elif d == "prev_ph":
-        msg = bot.send_message(uid, "📸 Новое фото:", reply_markup=back_kb())
-        bot.register_next_step_handler(msg, prev_edit, "photo")
     elif d == "prev_pr":
         msg = bot.send_message(uid, "💰 Новая цена:", reply_markup=back_kb())
         bot.register_next_step_handler(msg, prev_edit, "price")
@@ -654,9 +811,6 @@ def cb_all(call):
         temp.pop(uid, None)
         bot.delete_message(uid, call.message.message_id)
         bot.send_message(uid, "❌ Отменено.", reply_markup=main_kb(uid))
-    elif d.startswith("my_ph_"):
-        msg = bot.send_message(uid, "📸 Новое фото:", reply_markup=back_kb())
-        bot.register_next_step_handler(msg, my_edit_step, int(d.split("_")[2]), "photo")
     elif d.startswith("my_pr_"):
         msg = bot.send_message(uid, "💰 Новая цена:", reply_markup=back_kb())
         bot.register_next_step_handler(msg, my_edit_step, int(d.split("_")[2]), "price")
@@ -666,6 +820,7 @@ def cb_all(call):
     elif d.startswith("my_dl_"):
         cid = int(d.split("_")[2])
         db_exec("DELETE FROM cars WHERE id=?", (cid,))
+        db_exec("DELETE FROM favorites WHERE car_id=?", (cid,))
         bot.delete_message(uid, call.message.message_id)
         bot.send_message(uid, "🗑 Снято с продажи.", reply_markup=main_kb(uid))
     elif d == "open_f":
@@ -691,16 +846,36 @@ def cb_all(call):
         db_exec("UPDATE filters SET docs_only_clean=? WHERE user_id=?", (0 if f[11] == 1 else 1, uid))
         db_exec("DELETE FROM viewed WHERE user_id=?", (uid,))
         send_flt(uid, call.message.message_id)
+    elif d == "fn":
+        f = get_filter(uid)
+        db_exec("UPDATE filters SET notify=? WHERE user_id=?", (0 if f[12] == 1 else 1, uid))
+        send_flt(uid, call.message.message_id)
     elif d == "fr":
         db_exec("DELETE FROM filters WHERE user_id=?", (uid,))
         db_exec("DELETE FROM viewed WHERE user_id=?", (uid,))
         send_flt(uid, call.message.message_id)
+    elif d == "reset_v":
+        db_exec("DELETE FROM viewed WHERE user_id=?", (uid,))
+        next_car(uid)
     elif d in ["fs", "nx"]:
         next_car(uid)
+    elif d.startswith("fav_"):
+        cid = int(d.split("_")[1])
+        db_exec("INSERT OR IGNORE INTO favorites VALUES (?, ?)", (uid, cid))
+        bot.send_message(uid, "⭐ Добавлено в избранное!")
+    elif d.startswith("unfav_"):
+        cid = int(d.split("_")[1])
+        db_exec("DELETE FROM favorites WHERE user_id=? AND car_id=?", (uid, cid))
+        bot.delete_message(uid, call.message.message_id)
     elif d.startswith("lk_"):
-        c = db_exec("SELECT username, user_id FROM cars WHERE id=?", (int(d.split("_")[1]),), "one")
+        c = db_exec("SELECT username, user_id, brand, model FROM cars WHERE id=?", (int(d.split("_")[1]),), "one")
         if c:
-            bot.send_message(uid, f"📞 Контакт: @{c[0]}" if c[0] else f"📞 Профиль ID: {c[1]}")
+            mk = types.InlineKeyboardMarkup()
+            if c[0]:
+                mk.add(types.InlineKeyboardButton(f"💬 Написать @{c[0]}", url=f"https://t.me/{c[0]}"))
+            else:
+                mk.add(types.InlineKeyboardButton("💬 Открыть профиль продавца", url=f"tg://user?id={c[1]}"))
+            bot.send_message(uid, f"📞 Контакт продавца ({c[2]} {c[3]}):", reply_markup=mk)
         next_car(uid)
     elif d.startswith("rp_"):
         mk = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -724,6 +899,8 @@ def cb_all(call):
                 bot.send_message(c[1], f"✅ Ваше авто ({c[4]} {c[5]}) опубликовано!")
             except Exception:
                 pass
+            updated_c = db_exec("SELECT * FROM cars WHERE id=?", (cid,), "one")
+            notify_subscribers(updated_c)
         bot.delete_message(uid, call.message.message_id)
         adm_mod_next(uid)
     elif d.startswith("adm_wr_") and is_admin(uid):
@@ -736,10 +913,6 @@ def cb_all(call):
         mk.row("⬅️ Назад")
         msg = bot.send_message(uid, "🗑 Укажите причину удаления:", reply_markup=mk)
         bot.register_next_step_handler(msg, adm_action_step, f"del_{p[3]}", int(p[2]))
-    elif d.startswith("adm_cn_") and is_admin(uid):
-        c = db_exec("SELECT username, user_id FROM cars WHERE id=?", (int(d.split("_")[2]),), "one")
-        if c:
-            bot.send_message(uid, f"📞 Автор: @{c[0]}" if c[0] else f"📞 ID автора: {c[1]}")
     elif d == "adm_us" and is_admin(uid):
         adms = [str(r[0]) for r in db_exec("SELECT user_id FROM admins", fetch="all")]
         mk = types.InlineKeyboardMarkup()
@@ -750,5 +923,5 @@ def cb_all(call):
         bot.register_next_step_handler(msg, adm_action_step, "add_adm")
 
 
-print("Автовинчик запущен!")
-bot.polling(none_stop=True)
+print("Автовинчик v7 запущен!")
+bot.infinity_polling(timeout=10, long_polling_timeout=5)
