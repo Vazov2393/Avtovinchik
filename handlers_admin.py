@@ -8,7 +8,7 @@ from utils import (
     send_car_media, get_photos_list, format_adm_car,
     notify_admins, notify_subscribers
 )
-from handlers_user import prev_edit, my_edit_step
+from handlers_user import prev_edit, my_edit_step, my_edit_photos, show_edit_card, safe_del
 from handlers_buyer import send_flt, flt_step, next_car, rep_step
 
 
@@ -55,8 +55,11 @@ def adm_browse(uid, idx=0):
     send_car_media(uid, get_photos_list(c[3]), f"📋 ({idx + 1}/{len(cars)})\n\n" + format_adm_car(c), mk)
 
 
-def adm_action_step(m, mode, target_id=None):
+def adm_action_step(m, mode, target_id=None, prompt_id=None):
     uid = m.from_user.id
+    if prompt_id:
+        safe_del(uid, prompt_id)
+    safe_del(uid, m.message_id)
     if m.text == "⬅️ Назад":
         return bot.send_message(uid, "Отменено.", reply_markup=main_kb(uid))
     if mode == "sup_reply":
@@ -72,11 +75,21 @@ def adm_action_step(m, mode, target_id=None):
     elif mode == "warn":
         car = db_exec("SELECT * FROM cars WHERE id=?", (target_id,), "one")
         if car:
+            db_exec("UPDATE cars SET status='pending' WHERE id=?", (target_id,))
+            mk = types.InlineKeyboardMarkup()
+            mk.row(types.InlineKeyboardButton("✏️ Исправить", callback_data=f"edit_menu_{target_id}"))
             try:
-                bot.send_message(car[1], f"⚠️ ПРЕДУПРЕЖДЕНИЕ ОТ АДМИНА\nАвто: {car[4]} {car[5]} ({car[6]} г.)\nТекст: {m.text}")
+                bot.send_message(
+                    car[1],
+                    f"⚠️ ЗАМЕЧАНИЕ ОТ МОДЕРАТОРА\n"
+                    f"Авто: {car[4]} {car[5]} ({car[6]} г.)\n"
+                    f"Причина: {m.text}\n\n"
+                    f"Нажмите «✏️ Исправить», чтобы открыть страницу редактирования объявления:",
+                    reply_markup=mk
+                )
             except Exception:
                 pass
-        bot.send_message(uid, "✅ Предупреждение отправлено!", reply_markup=main_kb(uid))
+        bot.send_message(uid, "✅ Замечание отправлено пользователю!", reply_markup=main_kb(uid))
     elif mode.startswith("del_"):
         car = db_exec("SELECT * FROM cars WHERE id=?", (target_id,), "one")
         if car:
@@ -106,22 +119,37 @@ def cb_all(call):
     d = call.data
     bot.answer_callback_query(call.id)
 
+    # Открыть страницу редактирования объявления
+    if d.startswith("edit_menu_"):
+        cid = int(d.split("_")[2])
+        safe_del(uid, call.message.message_id)
+        show_edit_card(uid, cid)
+
+    # Повторная отправка на модерацию после исправления
+    elif d.startswith("fix_ok_"):
+        cid = int(d.split("_")[2])
+        car = db_exec("SELECT id, brand, model FROM cars WHERE id=? AND user_id=?", (cid, uid), "one")
+        if car:
+            safe_del(uid, call.message.message_id)
+            db_exec("UPDATE cars SET status='pending' WHERE id=?", (cid,))
+            bot.send_message(uid, f"⏳ Объявление ({car[1]} {car[2]}) отправлено на модерацию!", reply_markup=main_kb(uid))
+            notify_admins(cid)
+        else:
+            bot.send_message(uid, "❌ Объявление не найдено.")
+
     # Подтверждение актуальности (каждые 3 дня)
-    if d.startswith("act_ok_"):
+    elif d.startswith("act_ok_"):
         cid = int(d.split("_")[2])
         car = db_exec("SELECT id FROM cars WHERE id=? AND user_id=?", (cid, uid), "one")
         if car:
             now = int(time.time())
             db_exec("UPDATE cars SET published_at=?, check_sent_at=0 WHERE id=?", (now, cid))
-            try:
-                bot.delete_message(uid, call.message.message_id)
-            except Exception:
-                pass
+            safe_del(uid, call.message.message_id)
             bot.send_message(uid, "✅ Отлично! Ваше объявление продлено еще на 3 дня.")
         else:
             bot.send_message(uid, "❌ Объявление уже удалено.")
 
-    # Предпросмотр и личный кабинет
+    # Предпросмотр и редактирование полей
     elif d == "prev_ok":
         info = temp.pop(uid, None)
         if not info:
@@ -132,49 +160,71 @@ def cb_all(call):
             (uid, info["username"], photos_json, info["brand"], info["model"], info["year"], info["mileage"], info["gearbox"], info["engine"], info["price"], info["condition"], info["docs"], info["desc"], info["city"], info["lat"], info["lon"]),
             "id"
         )
-        bot.delete_message(uid, call.message.message_id)
+        safe_del(uid, call.message.message_id)
         bot.send_message(uid, "✅ Отправлено на модерацию!", reply_markup=main_kb(uid))
         notify_admins(cid)
     elif d == "prev_pr":
+        safe_del(uid, call.message.message_id)
         msg = bot.send_message(uid, "💰 Новая цена:", reply_markup=back_kb())
-        bot.register_next_step_handler(msg, prev_edit, "price")
+        bot.register_next_step_handler(msg, prev_edit, "price", msg.message_id)
     elif d == "prev_ds":
+        safe_del(uid, call.message.message_id)
         msg = bot.send_message(uid, "✍️ Новое описание:", reply_markup=back_kb())
-        bot.register_next_step_handler(msg, prev_edit, "desc")
+        bot.register_next_step_handler(msg, prev_edit, "desc", msg.message_id)
     elif d == "prev_no":
         temp.pop(uid, None)
-        bot.delete_message(uid, call.message.message_id)
+        safe_del(uid, call.message.message_id)
         bot.send_message(uid, "❌ Отменено.", reply_markup=main_kb(uid))
+    elif d.startswith("my_ph_"):
+        cid = int(d.split("_")[2])
+        safe_del(uid, call.message.message_id)
+        temp[f"edit_ph_{uid}"] = []
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.row("✅ Готово", "⬅️ Назад")
+        msg = bot.send_message(uid, "📸 Отправьте до 10 новых фото авто и нажмите «✅ Готово»:", reply_markup=kb)
+        bot.register_next_step_handler(msg, my_edit_photos, cid, msg.message_id)
     elif d.startswith("my_pr_"):
-        msg = bot.send_message(uid, "💰 Новая цена:", reply_markup=back_kb())
-        bot.register_next_step_handler(msg, my_edit_step, int(d.split("_")[2]), "price")
+        safe_del(uid, call.message.message_id)
+        msg = bot.send_message(uid, "💰 Введите новую цену (цифрами):", reply_markup=back_kb())
+        bot.register_next_step_handler(msg, my_edit_step, int(d.split("_")[2]), "price", msg.message_id)
+    elif d.startswith("my_ml_"):
+        safe_del(uid, call.message.message_id)
+        msg = bot.send_message(uid, "🛣 Введите новый пробег в км (цифрами):", reply_markup=back_kb())
+        bot.register_next_step_handler(msg, my_edit_step, int(d.split("_")[2]), "mileage", msg.message_id)
     elif d.startswith("my_ds_"):
-        msg = bot.send_message(uid, "📝 Новое описание:", reply_markup=back_kb())
-        bot.register_next_step_handler(msg, my_edit_step, int(d.split("_")[2]), "description")
+        safe_del(uid, call.message.message_id)
+        msg = bot.send_message(uid, "📝 Введите новое описание:", reply_markup=back_kb())
+        bot.register_next_step_handler(msg, my_edit_step, int(d.split("_")[2]), "description", msg.message_id)
     elif d.startswith("my_dl_"):
         cid = int(d.split("_")[2])
         db_exec("DELETE FROM cars WHERE id=?", (cid,))
         db_exec("DELETE FROM favorites WHERE car_id=?", (cid,))
-        bot.delete_message(uid, call.message.message_id)
+        safe_del(uid, call.message.message_id)
         bot.send_message(uid, "🗑 Снято с продажи.", reply_markup=main_kb(uid))
 
     # Фильтры и поиск
     elif d == "open_f":
+        safe_del(uid, call.message.message_id)
         send_flt(uid)
     elif d == "fb":
+        safe_del(uid, call.message.message_id)
         msg = bot.send_message(uid, "Выберите марку:", reply_markup=brands_kb(True))
         bot.register_next_step_handler(msg, flt_step, "brand")
     elif d == "fm":
+        safe_del(uid, call.message.message_id)
         f = get_filter(uid)
         msg = bot.send_message(uid, "Выберите модель:", reply_markup=models_kb(f[1], True))
         bot.register_next_step_handler(msg, flt_step, "model")
     elif d == "fy":
+        safe_del(uid, call.message.message_id)
         msg = bot.send_message(uid, "Год от и до (например: 2010 2020):", reply_markup=back_kb())
         bot.register_next_step_handler(msg, flt_step, "year")
     elif d == "fp":
+        safe_del(uid, call.message.message_id)
         msg = bot.send_message(uid, "Цена от и до (например: 100000 600000):", reply_markup=back_kb())
         bot.register_next_step_handler(msg, flt_step, "price")
     elif d == "fl":
+        safe_del(uid, call.message.message_id)
         msg = bot.send_message(uid, "Отправьте геопозицию или город:", reply_markup=geo_kb())
         bot.register_next_step_handler(msg, flt_step, "loc1")
     elif d == "fd":
@@ -191,9 +241,11 @@ def cb_all(call):
         db_exec("DELETE FROM viewed WHERE user_id=?", (uid,))
         send_flt(uid, call.message.message_id)
     elif d == "reset_v":
+        safe_del(uid, call.message.message_id)
         db_exec("DELETE FROM viewed WHERE user_id=?", (uid,))
         next_car(uid)
     elif d in ["fs", "nx"]:
+        safe_del(uid, call.message.message_id)
         next_car(uid)
     elif d.startswith("fav_"):
         cid = int(d.split("_")[1])
@@ -202,7 +254,7 @@ def cb_all(call):
     elif d.startswith("unfav_"):
         cid = int(d.split("_")[1])
         db_exec("DELETE FROM favorites WHERE user_id=? AND car_id=?", (uid, cid))
-        bot.delete_message(uid, call.message.message_id)
+        safe_del(uid, call.message.message_id)
     elif d.startswith("lk_"):
         c = db_exec("SELECT username, user_id, brand, model FROM cars WHERE id=?", (int(d.split("_")[1]),), "one")
         if c:
@@ -214,6 +266,7 @@ def cb_all(call):
             bot.send_message(uid, f"📞 Контакт продавца ({c[2]} {c[3]}):", reply_markup=mk)
         next_car(uid)
     elif d.startswith("rp_"):
+        safe_del(uid, call.message.message_id)
         mk = types.ReplyKeyboardMarkup(resize_keyboard=True)
         mk.row("Фейк / Мошенники", "Неверная цена")
         mk.row("Продано", "⬅️ Назад")
@@ -224,13 +277,15 @@ def cb_all(call):
     elif d.startswith("sup_rep_") and is_admin(uid):
         target_uid = int(d.split("_")[2])
         msg = bot.send_message(uid, f"✍️ Введите ответ для пользователя ID {target_uid} (текст или фото):", reply_markup=back_kb())
-        bot.register_next_step_handler(msg, adm_action_step, "sup_reply", target_uid)
+        bot.register_next_step_handler(msg, adm_action_step, "sup_reply", target_uid, msg.message_id)
     elif d == "adm_mod" and is_admin(uid):
+        safe_del(uid, call.message.message_id)
         adm_mod_next(uid)
     elif d == "adm_all" and is_admin(uid):
+        safe_del(uid, call.message.message_id)
         adm_browse(uid, 0)
     elif d.startswith("adm_br_") and is_admin(uid):
-        bot.delete_message(uid, call.message.message_id)
+        safe_del(uid, call.message.message_id)
         adm_browse(uid, int(d.split("_")[2]))
     elif d.startswith("adm_ok_") and is_admin(uid):
         cid = int(d.split("_")[2])
@@ -244,23 +299,27 @@ def cb_all(call):
                 pass
             updated_c = db_exec("SELECT * FROM cars WHERE id=?", (cid,), "one")
             notify_subscribers(updated_c)
-        bot.delete_message(uid, call.message.message_id)
+        safe_del(uid, call.message.message_id)
         adm_mod_next(uid)
     elif d.startswith("adm_wr_") and is_admin(uid):
-        msg = bot.send_message(uid, "⚠️ Введите текст предупреждения:", reply_markup=back_kb())
-        bot.register_next_step_handler(msg, adm_action_step, "warn", int(d.split("_")[2]))
+        safe_del(uid, call.message.message_id)
+        msg = bot.send_message(uid, "⚠️ Введите текст замечания:", reply_markup=back_kb())
+        bot.register_next_step_handler(msg, adm_action_step, "warn", int(d.split("_")[2]), msg.message_id)
     elif d.startswith("adm_dl_") and is_admin(uid):
+        safe_del(uid, call.message.message_id)
         p = d.split("_")
         mk = types.ReplyKeyboardMarkup(resize_keyboard=True)
         mk.row("Без причины", "Нарушение правил")
         mk.row("⬅️ Назад")
         msg = bot.send_message(uid, "🗑 Укажите причину удаления:", reply_markup=mk)
-        bot.register_next_step_handler(msg, adm_action_step, f"del_{p[3]}", int(p[2]))
+        bot.register_next_step_handler(msg, adm_action_step, f"del_{p[3]}", int(p[2]), msg.message_id)
     elif d == "adm_us" and is_admin(uid):
+        safe_del(uid, call.message.message_id)
         adms = [str(r[0]) for r in db_exec("SELECT user_id FROM admins", fetch="all")]
         mk = types.InlineKeyboardMarkup()
         mk.add(types.InlineKeyboardButton("➕ Добавить админа", callback_data="adm_add"))
         bot.send_message(uid, "👥 Админы:\n" + "\n".join(adms), reply_markup=mk)
     elif d == "adm_add" and is_admin(uid):
+        safe_del(uid, call.message.message_id)
         msg = bot.send_message(uid, "Введите ID нового админа или перешлите его сообщение:", reply_markup=back_kb())
-        bot.register_next_step_handler(msg, adm_action_step, "add_adm")
+        bot.register_next_step_handler(msg, adm_action_step, "add_adm", None, msg.message_id)
