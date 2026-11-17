@@ -4,34 +4,15 @@ import sqlite3
 import telebot
 from telebot import types
 from geopy.geocoders import Nominatim
+from catalog import CATALOG
 
-TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN") or "ВАШ_ТОКЕН_ОТ_BOTFATHER"
+TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN") or "ВАШ_ТОКЕН"
+MY_ADMIN_ID = 0
+
 bot = telebot.TeleBot(TOKEN)
 geolocator = Nominatim(user_agent="avtovinchik_v6")
 DB = "cars.db"
 temp = {}
-
-CATALOG = {
-    "Лада (ВАЗ)": ["Приора", "Гранта", "Веста", "Нива", "2114", "2110", "2107", "Калина"],
-    "Toyota": ["Camry", "Corolla", "RAV4", "Land Cruiser", "Prius", "Mark II"],
-    "Hyundai": ["Solaris", "Creta", "Elantra", "Sonata", "Tucson", "Accent"],
-    "Kia": ["Rio", "Ceed", "Optima", "K5", "Sportage", "Cerato", "Spectra"],
-    "Volkswagen": ["Polo", "Passat", "Tiguan", "Golf", "Jetta", "Touareg"],
-    "Skoda": ["Octavia", "Rapid", "Superb", "Kodiaq", "Yeti"],
-    "Nissan": ["Qashqai", "X-Trail", "Almera", "Teana", "Juke"],
-    "Ford": ["Focus", "Mondeo", "Fusion", "Fiesta", "Kuga"],
-    "Renault": ["Logan", "Duster", "Sandero", "Megane", "Kaptur"],
-    "Chevrolet": ["Cruze", "Lacetti", "Aveo", "Niva", "Cobalt"],
-    "BMW": ["3 серия", "5 серия", "7 серия", "X5", "X3", "X6"],
-    "Mercedes-Benz": ["C-класс", "E-класс", "S-класс", "GLC", "GLE"],
-    "Mazda": ["3", "6", "CX-5", "CX-7"],
-    "Mitsubishi": ["Lancer", "Outlander", "Pajero", "ASX"],
-    "Honda": ["Civic", "Accord", "CR-V", "Fit"],
-    "Audi": ["A4", "A6", "A3", "Q5", "Q7"],
-    "Chery": ["Tiggo 4", "Tiggo 7 Pro", "Tiggo 8"],
-    "Haval": ["Jolion", "F7", "H6", "Dargo"],
-    "Geely": ["Coolray", "Atlas", "Monjaro", "Emgrand"]
-}
 
 
 def db_exec(query, params=(), fetch=None):
@@ -65,6 +46,8 @@ init_db()
 
 
 def is_admin(uid):
+    if MY_ADMIN_ID and uid == MY_ADMIN_ID:
+        return True
     return bool(db_exec("SELECT 1 FROM admins WHERE user_id=?", (uid,), "one"))
 
 
@@ -117,10 +100,10 @@ def brands_kb(flt=False):
     m = types.ReplyKeyboardMarkup(resize_keyboard=True)
     if flt:
         m.row("Любая")
+    m.row("✍️ Ввести марку вручную", "⬅️ Назад")
     keys = list(CATALOG.keys())
     for i in range(0, len(keys), 2):
         m.row(*keys[i:i + 2])
-    m.row("✍️ Другая марка", "⬅️ Назад")
     return m
 
 
@@ -128,10 +111,10 @@ def models_kb(brand, flt=False):
     m = types.ReplyKeyboardMarkup(resize_keyboard=True)
     if flt:
         m.row("Любая")
+    m.row("✍️ Ввести модель вручную", "⬅️ Назад")
     mods = CATALOG.get(brand, [])
     for i in range(0, len(mods), 2):
         m.row(*mods[i:i + 2])
-    m.row("✍️ Другая модель", "⬅️ Назад")
     return m
 
 
@@ -144,7 +127,7 @@ def geo_kb():
 
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
-    uid = m.chat.id
+    uid = m.from_user.id
     get_filter(uid)
     cnt = db_exec("SELECT COUNT(*) FROM admins", fetch="one")
     if cnt and cnt[0] == 0:
@@ -152,51 +135,53 @@ def cmd_start(m):
     bot.send_message(uid, "👋 Добро пожаловать в Автовинчик!\nВыберите действие:", reply_markup=main_kb(uid))
 
 
+# --- ПРОДАЖА + ПРЕДПРОСМОТР ---
 @bot.message_handler(func=lambda m: m.text == "💰 Продать авто")
 def sell_1(m):
-    temp[m.chat.id] = {"username": m.from_user.username}
-    msg = bot.send_message(m.chat.id, "📸 Шаг 1/9. Отправьте фото авто:", reply_markup=back_kb())
+    uid = m.from_user.id
+    temp[uid] = {"username": m.from_user.username}
+    msg = bot.send_message(uid, "📸 Шаг 1/9. Отправьте фото авто:", reply_markup=back_kb())
     bot.register_next_step_handler(msg, sell_2)
 
 
 def sell_2(m):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
-        return bot.send_message(uid, "Меню:", reply_markup=main_kb(uid))
+        return bot.send_message(uid, "Главное меню:", reply_markup=main_kb(uid))
     if not m.photo:
-        msg = bot.send_message(uid, "❌ Отправьте фото:", reply_markup=back_kb())
+        msg = bot.send_message(uid, "❌ Отправьте именно фото:", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_2)
     temp[uid]["photo"] = m.photo[-1].file_id
-    msg = bot.send_message(uid, "🚘 Шаг 2/9. Выберите марку:", reply_markup=brands_kb())
+    msg = bot.send_message(uid, "🚘 Шаг 2/9. Выберите марку из списка или введите вручную:", reply_markup=brands_kb())
     bot.register_next_step_handler(msg, sell_3)
 
 
 def sell_3(m):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
-        msg = bot.send_message(uid, "📸 Шаг 1/9. Отправьте фото:", reply_markup=back_kb())
+        msg = bot.send_message(uid, "📸 Шаг 1/9. Отправьте фото авто:", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_2)
     if not m.text:
-        msg = bot.send_message(uid, "❌ Выберите марку:", reply_markup=brands_kb())
+        msg = bot.send_message(uid, "❌ Выберите марку кнопкой или напишите текстом:", reply_markup=brands_kb())
         return bot.register_next_step_handler(msg, sell_3)
-    if m.text == "✍️ Другая марка":
-        msg = bot.send_message(uid, "✍️ Введите марку:", reply_markup=back_kb())
+    if m.text == "✍️ Ввести марку вручную":
+        msg = bot.send_message(uid, "✍️ Напишите название марки:", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_3)
     temp[uid]["brand"] = m.text.strip()
-    msg = bot.send_message(uid, "📝 Шаг 3/9. Выберите модель:", reply_markup=models_kb(temp[uid]["brand"]))
+    msg = bot.send_message(uid, "📝 Шаг 3/9. Выберите модель из списка или введите вручную:", reply_markup=models_kb(temp[uid]["brand"]))
     bot.register_next_step_handler(msg, sell_4)
 
 
 def sell_4(m):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
         msg = bot.send_message(uid, "🚘 Шаг 2/9. Выберите марку:", reply_markup=brands_kb())
         return bot.register_next_step_handler(msg, sell_3)
     if not m.text:
         msg = bot.send_message(uid, "❌ Выберите модель:", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_4)
-    if m.text == "✍️ Другая модель":
-        msg = bot.send_message(uid, "✍️ Введите модель:", reply_markup=back_kb())
+    if m.text == "✍️ Ввести модель вручную":
+        msg = bot.send_message(uid, "✍️ Напишите название модели:", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_4)
     temp[uid]["model"] = m.text.strip()
     msg = bot.send_message(uid, "📅 Шаг 4/9. Введите год выпуска (цифрами):", reply_markup=back_kb())
@@ -204,7 +189,7 @@ def sell_4(m):
 
 
 def sell_5(m):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
         msg = bot.send_message(uid, "📝 Шаг 3/9. Выберите модель:", reply_markup=models_kb(temp[uid]["brand"]))
         return bot.register_next_step_handler(msg, sell_4)
@@ -217,7 +202,7 @@ def sell_5(m):
 
 
 def sell_6(m):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
         msg = bot.send_message(uid, "📅 Шаг 4/9. Введите год:", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_5)
@@ -233,7 +218,7 @@ def sell_6(m):
 
 
 def sell_7(m):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
         msg = bot.send_message(uid, "💰 Шаг 5/9. Введите цену:", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_6)
@@ -248,7 +233,7 @@ def sell_7(m):
 
 
 def sell_8(m):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
         kb_c = types.ReplyKeyboardMarkup(resize_keyboard=True)
         kb_c.row("Отличное", "На ходу / Есть нюансы")
@@ -263,7 +248,7 @@ def sell_8(m):
 
 
 def sell_9(m):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
         kb_d = types.ReplyKeyboardMarkup(resize_keyboard=True)
         kb_d.row("✅ Чистые (без проблем)", "⚠️ Есть проблемы")
@@ -279,7 +264,7 @@ def sell_9(m):
 
 
 def sell_10(m):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
         msg = bot.send_message(uid, "✍️ Шаг 8/9. Напишите описание:", reply_markup=back_kb())
         return bot.register_next_step_handler(msg, sell_9)
@@ -333,7 +318,7 @@ def show_preview(uid):
 
 
 def prev_edit(m, field):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
         return show_preview(uid)
     if field == "photo":
@@ -353,9 +338,10 @@ def prev_edit(m, field):
     show_preview(uid)
 
 
+# --- МОИ ОБЪЯВЛЕНИЯ ---
 @bot.message_handler(func=lambda m: m.text == "📋 Мои объявления")
 def my_cars(m):
-    uid = m.chat.id
+    uid = m.from_user.id
     cars = db_exec("SELECT * FROM cars WHERE user_id=? ORDER BY id DESC", (uid,), "all")
     if not cars:
         return bot.send_message(uid, "У вас нет объявлений.", reply_markup=main_kb(uid))
@@ -372,7 +358,7 @@ def my_cars(m):
 
 
 def my_edit_step(m, cid, field):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
         return bot.send_message(uid, "Отменено.", reply_markup=main_kb(uid))
     if field == "photo":
@@ -406,16 +392,20 @@ def notify_admins(cid):
         types.InlineKeyboardButton("⚠️ Предупреждение", callback_data=f"adm_wr_{cid}"),
         types.InlineKeyboardButton("🗑 Удалить", callback_data=f"adm_dl_{cid}_mod")
     )
-    for a in db_exec("SELECT user_id FROM admins", fetch="all"):
+    adms = [r[0] for r in db_exec("SELECT user_id FROM admins", fetch="all")]
+    if MY_ADMIN_ID and MY_ADMIN_ID not in adms:
+        adms.append(MY_ADMIN_ID)
+    for a in adms:
         try:
-            bot.send_photo(a[0], car[3], caption="⏳ НОВОЕ НА МОДЕРАЦИЮ\n\n" + format_adm_car(car), reply_markup=mk)
+            bot.send_photo(a, car[3], caption="⏳ НОВОЕ НА МОДЕРАЦИЮ\n\n" + format_adm_car(car), reply_markup=mk)
         except Exception:
             pass
 
 
+# --- ФИЛЬТР И ЛЕНТА ---
 @bot.message_handler(func=lambda m: m.text == "⚙️ Мой фильтр")
 def flt_menu(m):
-    send_flt(m.chat.id)
+    send_flt(m.from_user.id)
 
 
 def send_flt(uid, mid=None):
@@ -441,19 +431,19 @@ def send_flt(uid, mid=None):
 
 
 def flt_step(m, mode):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
-        bot.send_message(uid, "Меню:", reply_markup=main_kb(uid))
+        bot.send_message(uid, "Главное меню:", reply_markup=main_kb(uid))
         return send_flt(uid)
     if mode == "brand":
-        if m.text == "✍️ Другая марка":
-            msg = bot.send_message(uid, "Введите марку:", reply_markup=back_kb())
+        if m.text == "✍️ Ввести марку вручную":
+            msg = bot.send_message(uid, "Введите марку или слово Любая:", reply_markup=back_kb())
             return bot.register_next_step_handler(msg, flt_step, "brand")
         v = "Любая" if m.text.lower() == "любая" else m.text.strip()
         db_exec("UPDATE filters SET brand=?, model='Любая' WHERE user_id=?", (v, uid))
     elif mode == "model":
-        if m.text == "✍️ Другая модель":
-            msg = bot.send_message(uid, "Введите модель:", reply_markup=back_kb())
+        if m.text == "✍️ Ввести модель вручную":
+            msg = bot.send_message(uid, "Введите модель или слово Любая:", reply_markup=back_kb())
             return bot.register_next_step_handler(msg, flt_step, "model")
         v = "Любая" if m.text.lower() == "любая" else m.text.strip()
         db_exec("UPDATE filters SET model=? WHERE user_id=?", (v, uid))
@@ -500,7 +490,7 @@ def flt_step(m, mode):
 
 @bot.message_handler(func=lambda m: m.text == "🚗 Купить авто")
 def buy_start(m):
-    next_car(m.chat.id)
+    next_car(m.from_user.id)
 
 
 def next_car(uid):
@@ -538,7 +528,7 @@ def next_car(uid):
 
 
 def rep_step(m, cid):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
         bot.send_message(uid, "Отменено.", reply_markup=main_kb(uid))
         return next_car(uid)
@@ -546,24 +536,28 @@ def rep_step(m, cid):
     if car:
         mk = types.InlineKeyboardMarkup()
         mk.row(types.InlineKeyboardButton("⚠️ Предупреждение", callback_data=f"adm_wr_{cid}"), types.InlineKeyboardButton("🗑 Удалить", callback_data=f"adm_dl_{cid}_rep"))
-        for a in db_exec("SELECT user_id FROM admins", fetch="all"):
+        adms = [r[0] for r in db_exec("SELECT user_id FROM admins", fetch="all")]
+        if MY_ADMIN_ID and MY_ADMIN_ID not in adms:
+            adms.append(MY_ADMIN_ID)
+        for a in adms:
             try:
-                bot.send_photo(a[0], car[3], caption=f"🚩 ЖАЛОБА ОТ ID {uid}\nПричина: {m.text}\n\n" + format_adm_car(car), reply_markup=mk)
+                bot.send_photo(a, car[3], caption=f"🚩 ЖАЛОБА ОТ ID {uid}\nПричина: {m.text}\n\n" + format_adm_car(car), reply_markup=mk)
             except Exception:
                 pass
     bot.send_message(uid, "✅ Жалоба отправлена админам!", reply_markup=main_kb(uid))
     next_car(uid)
 
 
+# --- АДМИНКА ---
 @bot.message_handler(commands=["admin"])
 @bot.message_handler(func=lambda m: m.text == "👑 Админ-панель")
 def adm_panel(m):
-    uid = m.chat.id
+    uid = m.from_user.id
     cnt = db_exec("SELECT COUNT(*) FROM admins", fetch="one")
     if cnt and cnt[0] == 0:
         db_exec("INSERT OR IGNORE INTO admins VALUES (?)", (uid,))
     if not is_admin(uid):
-        return bot.send_message(uid, "Нет доступа.")
+        return bot.send_message(uid, "Нет доступа.", reply_markup=main_kb(uid))
     ap = db_exec("SELECT COUNT(*) FROM cars WHERE status='approved'", fetch="one")[0]
     pn = db_exec("SELECT COUNT(*) FROM cars WHERE status='pending'", fetch="one")[0]
     us = db_exec("SELECT COUNT(*) FROM filters", fetch="one")[0]
@@ -577,7 +571,7 @@ def adm_panel(m):
 def adm_mod_next(uid):
     car = db_exec("SELECT * FROM cars WHERE status='pending' ORDER BY id ASC LIMIT 1", fetch="one")
     if not car:
-        return bot.send_message(uid, "✅ На проверке пусто.")
+        return bot.send_message(uid, "✅ На проверке пусто.", reply_markup=main_kb(uid))
     mk = types.InlineKeyboardMarkup()
     mk.row(types.InlineKeyboardButton("✅ Одобрить", callback_data=f"adm_ok_{car[0]}"))
     mk.row(types.InlineKeyboardButton("⚠️ Предупреждение", callback_data=f"adm_wr_{car[0]}"), types.InlineKeyboardButton("🗑 Удалить", callback_data=f"adm_dl_{car[0]}_mod"))
@@ -587,7 +581,7 @@ def adm_mod_next(uid):
 def adm_browse(uid, idx=0):
     cars = db_exec("SELECT * FROM cars WHERE status='approved' ORDER BY id DESC", fetch="all")
     if not cars:
-        return bot.send_message(uid, "Объявлений нет.")
+        return bot.send_message(uid, "Объявлений нет.", reply_markup=main_kb(uid))
     idx = idx % len(cars)
     c = cars[idx]
     mk = types.InlineKeyboardMarkup()
@@ -599,7 +593,7 @@ def adm_browse(uid, idx=0):
 
 
 def adm_action_step(m, mode, cid=None):
-    uid = m.chat.id
+    uid = m.from_user.id
     if m.text == "⬅️ Назад":
         return bot.send_message(uid, "Отменено.", reply_markup=main_kb(uid))
     if mode == "warn":
@@ -631,9 +625,10 @@ def adm_action_step(m, mode, cid=None):
             bot.send_message(uid, "❌ Неверный ID.", reply_markup=main_kb(uid))
 
 
+# --- CALLBACKS ---
 @bot.callback_query_handler(func=lambda call: True)
 def cb_all(call):
-    uid = call.message.chat.id
+    uid = call.from_user.id
     d = call.data
     bot.answer_callback_query(call.id)
 
@@ -672,7 +667,7 @@ def cb_all(call):
         cid = int(d.split("_")[2])
         db_exec("DELETE FROM cars WHERE id=?", (cid,))
         bot.delete_message(uid, call.message.message_id)
-        bot.send_message(uid, "🗑 Снято с продажи.")
+        bot.send_message(uid, "🗑 Снято с продажи.", reply_markup=main_kb(uid))
     elif d == "open_f":
         send_flt(uid)
     elif d == "fb":
